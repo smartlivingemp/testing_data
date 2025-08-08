@@ -22,6 +22,16 @@ services_col = db["services"]  # reserved for future lookups
 TOPPILY_URL = "https://toppily.com/api/v1/buy-other-package"
 TOPPILY_API_KEY = os.getenv("TOPPILY_API_KEY", "").strip()
 TOPPILY_MOCK = os.getenv("TOPPILY_MOCK", "0").lower() in ("1", "true", "yes")
+TOPPILY_VERIFY_SSL = os.getenv("TOPPILY_VERIFY_SSL", "1").lower() in ("1", "true", "yes")
+
+# Force Requests & OpenSSL to use certifi’s bundle (helps on Render)
+try:
+    ca_path = certifi.where()
+    os.environ.setdefault("SSL_CERT_FILE", ca_path)
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_path)
+    print("[SSL] Using CA bundle:", ca_path)
+except Exception as _e:
+    print("[SSL] Could not set CA envs:", _e)
 
 # --- Helpers ---
 def generate_order_id():
@@ -36,7 +46,7 @@ def _money(v):
 def _send_toppily_by_package(phone: str, package_id: int, trx_ref: str):
     """
     Call Toppily with {recipient_msisdn, package_id, trx_ref}.
-    Returns (success: bool, payload: dict) where payload contains parsed response + http_status.
+    Returns (success: bool, payload: dict) where payload includes parsed response + http_status.
     """
     # MOCK: simulate success/failure without calling Toppily
     if TOPPILY_MOCK:
@@ -53,7 +63,6 @@ def _send_toppily_by_package(phone: str, package_id: int, trx_ref: str):
         print("[TOPPILY:MOCK]", sim)
         return ok, sim
 
-    # REAL call
     headers = {
         "x-api-key": TOPPILY_API_KEY,
         "Accept": "application/json",
@@ -65,7 +74,6 @@ def _send_toppily_by_package(phone: str, package_id: int, trx_ref: str):
         "trx_ref": trx_ref,
     }
 
-    # Fast validation to avoid confusing 502s
     if not TOPPILY_API_KEY:
         err = {"success": False, "message": "Missing TOPPILY_API_KEY env", "http_status": 500}
         print("[TOPPILY:CONFIG ERROR]", err)
@@ -76,8 +84,8 @@ def _send_toppily_by_package(phone: str, package_id: int, trx_ref: str):
             TOPPILY_URL,
             headers=headers,
             json=body,
-            timeout=35,                  # a bit more lenient in prod
-            verify=certifi.where(),
+            timeout=35,
+            verify=(certifi.where() if TOPPILY_VERIFY_SSL else False),
         )
         text = resp.text or ""
         try:
@@ -86,10 +94,21 @@ def _send_toppily_by_package(phone: str, package_id: int, trx_ref: str):
             data = {"raw": text}
 
         payload = {**data, "http_status": resp.status_code}
-        print("[TOPPILY]", resp.status_code, payload)  # shows up in Render logs
+        print("[TOPPILY]", resp.status_code, payload)  # visible in Render logs
 
         ok = resp.ok and bool(data.get("success", False))
         return ok, payload
+
+    except requests.exceptions.SSLError as e:
+        err = {
+            "success": False,
+            "error": f"SSL error: {e}",
+            "hint": "Cert verification failed. Using certifi bundle. If this persists, Toppily may need to fix their TLS chain. "
+                    "TEMPORARY ONLY: set TOPPILY_VERIFY_SSL=0 to bypass.",
+            "http_status": 597,
+        }
+        print("[TOPPILY:SSL ERROR]", err)
+        return False, err
     except requests.RequestException as e:
         err = {"success": False, "error": str(e), "http_status": 599}
         print("[TOPPILY:EXCEPTION]", err)
@@ -187,7 +206,7 @@ def process_checkout():
 
     # 🧮 If nothing succeeded, do not charge; log and return 502 with reasons
     if total_success_amount <= 0:
-        order_doc = {
+        orders_col.insert_one({
             "user_id": user_id,
             "order_id": order_id,
             "items": results,
@@ -197,8 +216,7 @@ def process_checkout():
             "paid_from": method,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
-        }
-        orders_col.insert_one(order_doc)
+        })
         return jsonify({
             "success": False,
             "message": "No items were processed successfully. You were not charged.",
@@ -215,7 +233,7 @@ def process_checkout():
 
     # 🧾 Record order with per-item statuses
     status = "completed" if total_success_amount == total_requested else "partial"
-    order_doc = {
+    orders_col.insert_one({
         "user_id": user_id,
         "order_id": order_id,
         "items": results,
@@ -225,8 +243,7 @@ def process_checkout():
         "paid_from": method,
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
-    }
-    orders_col.insert_one(order_doc)
+    })
 
     # 🧾 Transaction record (only for charged amount)
     transactions_col.insert_one({
