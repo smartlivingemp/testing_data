@@ -5,7 +5,6 @@ from datetime import datetime
 import os
 import uuid
 import random
-import json
 import requests
 import certifi
 
@@ -17,11 +16,14 @@ checkout_bp = Blueprint("checkout", __name__)
 balances_col = db["balances"]
 orders_col = db["orders"]
 transactions_col = db["transactions"]
-services_col = db["services"]  # to read network info if needed later
+services_col = db["services"]  # reserved for future lookups
 
+# --- Toppily config ---
 TOPPILY_URL = "https://toppily.com/api/v1/buy-other-package"
-TOPPILY_API_KEY = os.getenv("TOPPILY_API_KEY", "68b5ec28de8abe4f99a77a5434e032fc78b8d2d8")
+TOPPILY_API_KEY = os.getenv("TOPPILY_API_KEY", "").strip()
+TOPPILY_MOCK = os.getenv("TOPPILY_MOCK", "0").lower() in ("1", "true", "yes")
 
+# --- Helpers ---
 def generate_order_id():
     return f"NAN{random.randint(10000, 99999)}"
 
@@ -33,9 +35,25 @@ def _money(v):
 
 def _send_toppily_by_package(phone: str, package_id: int, trx_ref: str):
     """
-    Send one purchase to Toppily using package_id flow.
-    Returns (success: bool, payload: dict) where payload is the parsed/Raw response.
+    Call Toppily with {recipient_msisdn, package_id, trx_ref}.
+    Returns (success: bool, payload: dict) where payload contains parsed response + http_status.
     """
+    # MOCK: simulate success/failure without calling Toppily
+    if TOPPILY_MOCK:
+        ok = int(package_id) % 2 == 0  # even ids succeed (lets you test partials)
+        sim = {
+            "success": ok,
+            "message": "Simulated Toppily response (MOCK)",
+            "transaction_code": f"mock_{uuid.uuid4().hex[:10]}",
+            "http_status": 200 if ok else 422,
+            "package_id": int(package_id),
+            "recipient_msisdn": phone,
+            "trx_ref": trx_ref,
+        }
+        print("[TOPPILY:MOCK]", sim)
+        return ok, sim
+
+    # REAL call
     headers = {
         "x-api-key": TOPPILY_API_KEY,
         "Accept": "application/json",
@@ -46,26 +64,36 @@ def _send_toppily_by_package(phone: str, package_id: int, trx_ref: str):
         "package_id": int(package_id),
         "trx_ref": trx_ref,
     }
+
+    # Fast validation to avoid confusing 502s
+    if not TOPPILY_API_KEY:
+        err = {"success": False, "message": "Missing TOPPILY_API_KEY env", "http_status": 500}
+        print("[TOPPILY:CONFIG ERROR]", err)
+        return False, err
+
     try:
         resp = requests.post(
             TOPPILY_URL,
             headers=headers,
             json=body,
-            timeout=25,
-            verify=certifi.where(),  # fix SSL on Windows/older envs
+            timeout=35,                  # a bit more lenient in prod
+            verify=certifi.where(),
         )
         text = resp.text or ""
-        # Try to decode JSON; if it fails, store raw string
         try:
             data = resp.json()
         except Exception:
-            data = {"raw": text, "http_status": resp.status_code}
+            data = {"raw": text}
 
-        # Toppily returns {"success": true/false, ...}
+        payload = {**data, "http_status": resp.status_code}
+        print("[TOPPILY]", resp.status_code, payload)  # shows up in Render logs
+
         ok = resp.ok and bool(data.get("success", False))
-        return ok, data
+        return ok, payload
     except requests.RequestException as e:
-        return False, {"error": str(e)}
+        err = {"success": False, "error": str(e), "http_status": 599}
+        print("[TOPPILY:EXCEPTION]", err)
+        return False, err
 
 @checkout_bp.route("/checkout", methods=["POST"])
 def process_checkout():
@@ -73,6 +101,7 @@ def process_checkout():
     if "user_id" not in session or session.get("role") != "customer":
         return jsonify({"success": False, "message": "Not authorized"}), 401
 
+    # Validate session user id
     try:
         user_id = ObjectId(session["user_id"])
     except Exception:
@@ -106,13 +135,13 @@ def process_checkout():
     # 🚀 Call Toppily for each item by package_id
     results = []
     total_success_amount = 0.0
+
     for idx, item in enumerate(cart, start=1):
         phone = (item.get("phone") or "").strip()
-        # We stored parsed value in value_obj: {"id": <package_id>, "volume": <MB>}
-        value_obj = item.get("value_obj") or {}
+        value_obj = item.get("value_obj") or {}   # expected: {"id": <package_id>, ...}
         pkg_id = value_obj.get("id")
 
-        if not phone or not pkg_id:
+        if not phone or pkg_id in (None, "", []):
             results.append({
                 "phone": phone,
                 "amount": _money(item.get("amount")),
@@ -123,8 +152,23 @@ def process_checkout():
             })
             continue
 
+        # Ensure pkg_id is int
+        try:
+            pkg_id = int(pkg_id)
+        except Exception:
+            results.append({
+                "phone": phone,
+                "amount": _money(item.get("amount")),
+                "value": item.get("value"),
+                "value_obj": value_obj,
+                "api_status": "skipped",
+                "api_response": {"error": f"package_id must be int, got {value_obj.get('id')!r}"}
+            })
+            continue
+
         trx_ref = f"{order_id}_{idx}_{uuid.uuid4().hex[:6]}"
-        ok, payload = _send_toppily_by_package(phone, int(pkg_id), trx_ref)
+
+        ok, payload = _send_toppily_by_package(phone, pkg_id, trx_ref)
 
         results.append({
             "phone": phone,
@@ -141,9 +185,8 @@ def process_checkout():
         if ok:
             total_success_amount += _money(item.get("amount"))
 
-    # 🧮 Nothing succeeded?
+    # 🧮 If nothing succeeded, do not charge; log and return 502 with reasons
     if total_success_amount <= 0:
-        # Log failed order
         order_doc = {
             "user_id": user_id,
             "order_id": order_id,
@@ -160,11 +203,10 @@ def process_checkout():
             "success": False,
             "message": "No items were processed successfully. You were not charged.",
             "order_id": order_id,
-            "details": results
+            "details": results  # includes per-item api_response + http_status
         }), 502
 
     # 💳 Charge only for successful items
-    # (Since we pre-checked the full balance, we can safely deduct the smaller success sum now.)
     balances_col.update_one(
         {"user_id": user_id},
         {"$inc": {"amount": -total_success_amount}, "$set": {"updated_at": datetime.utcnow()}},
@@ -177,8 +219,8 @@ def process_checkout():
         "user_id": user_id,
         "order_id": order_id,
         "items": results,
-        "total_amount": total_requested,   # what user asked to buy
-        "charged_amount": total_success_amount,  # what we actually charged
+        "total_amount": total_requested,        # requested total
+        "charged_amount": total_success_amount, # actually charged
         "status": status,
         "paid_from": method,
         "created_at": datetime.utcnow(),
