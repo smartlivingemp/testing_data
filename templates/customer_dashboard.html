@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Customer Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+
+  <style>
+    .scrolling-wrapper {
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: var(--sea-blue) #f1f1f1;
+}
+
+.scrolling-wrapper::-webkit-scrollbar {
+  height: 8px;
+}
+.scrolling-wrapper::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+.scrolling-wrapper::-webkit-scrollbar-thumb {
+  background-color: var(--sea-blue);
+  border-radius: 10px;
+}
+
+    :root { --sea-blue:#0ea5e9; }
+    .svc-card { border:1px solid #e9ecef; border-radius:12px; padding:1rem; height:100%; }
+    .svc-img  { width:100%; height:140px; object-fit:cover; border-radius:10px; background:#f3f6f9; }
+    .row-table thead th { background:#f8fafc; }
+    .floating-cart { position:fixed; right:16px; bottom:16px; z-index:1050; }
+    .btn-cart { position:relative; border-radius:999px; padding:.75rem 1rem; font-weight:600;
+                background:var(--sea-blue); color:#fff; border:none;
+                box-shadow:0 8px 24px rgba(14,165,233,.35); }
+    .btn-cart .badge { position:absolute; top:-6px; right:-6px; }
+    .bulk-trigger { cursor:text; }
+    .amount-cell { min-width: 80px; }
+    @media (max-width:576px){
+      .svc-img{height:120px}
+      .btn-cart{padding:.6rem .9rem}
+      .input-group>.form-select{min-width: 150px;}
+    }
+  </style>
+</head>
+<body>
+    {% include 'customer_sidebar.html' %}
+
+<div class="container my-4">
+  <div class="row g-4">
+    <div class="col-12">
+      <div class="card shadow-sm rounded-4 text-center p-4 bg-light border-0">
+        <div class="row align-items-center">
+          <div class="col-12 col-md-6 mb-3 mb-md-0">
+            <h5 class="mb-1 text-muted">Wallet Balance</h5>
+            <h3 class="text-success fw-bold">GHS {{ '%.2f'|format(balance) }}</h3>
+          </div>
+          <div class="col-12 col-md-6">
+            <a href="{{ url_for('deposit.deposit_page') }}" class="btn btn-primary btn-lg w-100">
+              <i class="bi bi-wallet2 me-2"></i>Deposit Funds
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="container my-5">
+  <div class="card border-0 shadow-lg overflow-hidden rounded-4">
+    <div class="row g-0">
+      <div class="col-md-6">
+        <img src="https://www.clearstream.com/resource/blob/4223852/2347d4d950785e346dfe8957a76c26b3/doorpage-586x330-connectivity-and-data-data.jpg"
+             alt="Connectivity Data"
+             class="img-fluid w-100 h-100 object-fit-cover">
+      </div>
+      <div class="col-md-6 d-flex align-items-center bg-light p-4">
+        <div>
+          <h4 class="text-primary fw-bold mb-3">Fast, Reliable, Data Services</h4>
+          <p class="text-muted">Experience seamless connectivity, powerful tools, and real-time delivery. Top up or order in seconds.</p>
+          <a href="#services" class="btn btn-outline-primary mt-2">
+            View Services
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+  <div class="container py-4">
+    <h2 class="text-center mb-4">Make an Order</h2>
+
+    <!-- Services -->
+    <!-- Services -->
+<div class="mb-4">
+  <label class="form-label fw-semibold">Service</label>
+  <div class="scrolling-wrapper d-flex flex-nowrap overflow-auto pb-2 gap-3">
+    {% for svc in services %}
+    <div class="flex-shrink-0" style="width: 220px;">
+      <div class="svc-card h-100 shadow-sm">
+        {% if svc.image_url %}
+          <img src="{{ svc.image_url }}" class="svc-img mb-2" alt="{{ svc.name }}">
+        {% endif %}
+        <div class="d-flex justify-content-between align-items-center">
+          <div class="fw-semibold text-truncate">{{ svc.name }}</div>
+          <button
+            class="btn btn-sm btn-outline-primary select-service-btn"
+            data-service='{{ {"_id_str": svc._id_str, "name": svc.name, "offers": svc.offers or []} | tojson }}'>
+            Buy
+          </button>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+    {% if services|length == 0 %}
+      <div class="text-muted">No services available yet.</div>
+    {% endif %}
+  </div>
+</div>
+
+    <hr class="my-5">
+
+<!-- Work area -->
+<div id="work-area" class="d-none">
+  <div class="card border-0 shadow-sm rounded-4 p-4 mb-5 bg-white">
+
+    <!-- Header -->
+    <div class="d-flex flex-wrap justify-content-between align-items-center mb-4">
+      <h4 class="mb-2 mb-md-0 fw-bold">
+        <i class="bi bi-gear-fill text-primary me-2"></i>
+        Service: <span id="chosen-service-name" class="text-primary"></span>
+      </h4>
+      <div class="d-flex gap-2">
+        <button class="btn btn-sm btn-outline-primary" id="add-row-btn">
+          <i class="bi bi-plus-circle me-1"></i> Add Row
+        </button>
+        <button class="btn btn-sm btn-outline-secondary" id="clear-rows-btn">
+          <i class="bi bi-trash3 me-1"></i> Clear Rows
+        </button>
+      </div>
+    </div>
+
+    <!-- Bulk Input Trigger -->
+    <div class="mb-4">
+      <input id="bulk-trigger" type="text" class="form-control bulk-trigger"
+             placeholder="📋 Paste bulk orders (e.g. 0241234567 1)">
+      <small class="text-muted">Click to expand and paste orders in bulk.</small>
+    </div>
+
+    <!-- Bulk Paste Area -->
+    <div id="bulk-card" class="card mb-4 d-none">
+      <div class="card-body">
+        <div class="d-flex flex-column flex-md-row gap-4">
+          <div class="flex-grow-1">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+              <label class="form-label fw-semibold mb-0">Bulk Paste (one per line)</label>
+              <button type="button" id="hide-bulk-btn" class="btn btn-sm btn-outline-secondary">Hide</button>
+            </div>
+            <textarea id="bulk-paste" class="form-control" rows="5"
+                      placeholder="Example:
+0241234567 1
+0559876543 5"></textarea>
+            <small class="text-muted">
+              Format: <code>PHONE VALUE</code> (e.g. <code>0284039645 5</code> → 5 GB). We’ll match VALUE to an offer for the selected service.
+            </small>
+          </div>
+          <div class="align-self-end">
+            <button id="apply-bulk-btn" class="btn btn-outline-primary mt-3">
+              <i class="bi bi-check2-square me-1"></i> Apply to Rows
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Entry Rows -->
+    <div id="form-rows-wrapper" class="mb-4">
+      <div class="row g-3 align-items-end mb-3" id="rows-body">
+        <!-- JavaScript appends each row here -->
+      </div>
+    </div>
+
+    <!-- Add to Cart -->
+    <div class="text-end">
+      <button id="add-all-to-cart" class="btn btn-success btn-lg px-4">
+        <i class="bi bi-cart-plus me-1"></i> Add All to Cart
+      </button>
+    </div>
+
+  </div>
+</div>
+
+
+
+<div class="container mb-5">
+  <div class="d-flex align-items-center mb-3">
+    <i class="bi bi-box-seam-fill me-2 fs-4 text-primary"></i>
+    <h4 class="mb-0">Recent Orders</h4>
+  </div>
+
+  {% if recent_orders %}
+    <div class="card shadow-sm">
+      <div class="card-body table-responsive">
+        <table class="table table-hover align-middle">
+          <thead class="table-light">
+            <tr>
+              <th>Order ID</th>
+              <th>Service</th>
+              <th>Phone Number(s)</th>
+              <th>Total (GHS)</th>
+              <th>Status</th>
+              <th>Date</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for order in recent_orders %}
+              <tr>
+                <td>
+                  <span class="badge bg-primary">{{ order.order_id or "N/A" }}</span>
+                </td>
+                <td>
+                  {% if order["items"] and order["items"][0]["serviceName"] %}
+                    {{ order["items"][0]["serviceName"] }}
+                  {% else %}
+                    <span class="text-muted">N/A</span>
+                  {% endif %}
+                </td>
+                <td>
+                  {{ order["items"]|length }} phone number{{ 's' if order["items"]|length > 1 }}
+                </td>
+                <td>
+                  GHS {{ '%.2f'|format(order.total_amount or 0) }}
+                </td>
+                <td>
+                  {% if order.status == "pending" %}
+                    <span class="badge bg-warning text-dark">Pending</span>
+                  {% elif order.status == "completed" %}
+                    <span class="badge bg-success">Completed</span>
+                  {% else %}
+                    <span class="badge bg-secondary">{{ order.status|capitalize }}</span>
+                  {% endif %}
+                </td>
+                <td>
+                  {{ order.created_at.strftime('%d %b %Y, %I:%M %p') if order.created_at }}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% else %}
+    <div class="text-muted">No recent orders yet.</div>
+  {% endif %}
+</div>
+{% include 'customer_footer.html' %}
+  <!-- Floating Cart -->
+  <div class="floating-cart">
+    <button type="button" class="btn-cart" data-bs-toggle="modal" data-bs-target="#cartModal">
+      🛒 Cart <span class="badge bg-danger" id="cart-count">0</span>
+    </button>
+  </div>
+
+  <!-- Cart / Checkout Modal -->
+  <!-- Cart / Checkout Modal -->
+<div class="modal fade" id="cartModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Your Cart</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div id="cart-empty" class="text-muted">Your cart is empty.</div>
+
+        <div id="cart-list-wrapper" class="d-none">
+          <div class="table-responsive">
+            <table class="table align-middle">
+              <thead>
+                <tr>
+                  <th>Service</th>
+                  <th>Phone</th>
+                  <th>Offer (Value)</th>
+                  <th>Amount (GHS)</th>
+                  <th style="width:80px;"></th>
+                </tr>
+              </thead>
+              <tbody id="cart-list"></tbody>
+            </table>
+          </div>
+
+          <div class="d-flex justify-content-between align-items-center mb-3">
+            <button id="clear-cart-btn" class="btn btn-outline-danger btn-sm">Clear Cart</button>
+            <div class="fs-5 fw-semibold">Total: GHS <span id="cart-total">0.00</span></div>
+          </div>
+<div class="text-end mb-3">
+  <button id="checkout-btn" class="btn btn-primary">Proceed to Checkout</button>
+</div>
+
+          <!-- Checkout Section (hidden until proceed) -->
+          <div id="checkout-section" class="border-top pt-3 d-none">
+            <h5 class="mb-3">💳 Checkout</h5>
+            <div class="mb-3">
+              <label class="form-label fw-semibold">Payment Method</label>
+              <select class="form-select" id="payment-method">
+                <option value="from_account" selected>From Account</option>
+                <!-- You can add more methods here -->
+              </select>
+            </div>
+            <div class="mb-3">
+              <label class="form-label fw-semibold">Total Payable</label>
+              <div class="fs-5 fw-bold text-success">GHS <span id="checkout-total">0.00</span></div>
+            </div>
+            <div class="text-end">
+              <button id="confirm-payment-btn" class="btn btn-success">✅ Confirm Payment</button>
+            </div>
+          </div>
+        </div>
+      </div>
+     
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+let chosenService = null;
+const rowsBody = document.getElementById("rows-body");
+const workArea = document.getElementById("work-area");
+const chosenNameEl = document.getElementById("chosen-service-name");
+const cart = [];
+
+const bulkTrigger = document.getElementById("bulk-trigger");
+const bulkCard = document.getElementById("bulk-card");
+const hideBulkBtn = document.getElementById("hide-bulk-btn");
+
+function money(n) {
+  return Number(n || 0).toFixed(2);
+}
+
+function renderOfferOptions(offers) {
+  return `
+    <option value="">-- Choose Offer --</option>
+    ${(offers || []).map(o => {
+      const label = o.value_text ? o.value_text : formatVolumeLabel(o.value);
+      const raw = JSON.stringify(o.value ?? "");
+      // value = amount (for price), keep raw `value` in data-value
+      return `<option value="${o.amount}" data-value='${raw}'>GHS ${o.amount} — ${label}</option>`;
+    }).join("")}
+  `;
+}
+
+function addRow(phone = "", selected = "") {
+  const row = document.createElement("div");
+  row.className = "col-12";
+
+  row.innerHTML = `
+    <div class="card border rounded-3 p-3 shadow-sm mb-2">
+      <div class="row g-3">
+        <div class="col-12 col-md-5">
+          <input type="text" class="form-control phone-input" placeholder="Phone number" value="${phone}">
+        </div>
+        <div class="col-12 col-md-5">
+          <select class="form-select offer-select">
+            ${chosenService ? renderOfferOptions(chosenService.offers) : '<option>-- Choose Offer --</option>'}
+          </select>
+        </div>
+        <div class="col-12 col-md-2 d-flex justify-content-between align-items-center">
+          <div class="amount-cell fw-semibold text-primary">-</div>
+          <button class="btn btn-sm btn-outline-danger remove-row-btn"><i class="bi bi-x-lg"></i></button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  rowsBody.appendChild(row);
+
+  const sel = row.querySelector(".offer-select");
+  const amtCell = row.querySelector(".amount-cell");
+  sel.addEventListener("change", () => {
+  const opt = sel.selectedOptions[0];
+  if (!opt || !sel.value) {
+    amtCell.textContent = "-";
+    return;
+  }
+  const amt = Number(sel.value || 0);
+  amtCell.textContent = `GHS ${money(amt)}`;
+});
+
+  if (selected) {
+    sel.value = selected;
+    sel.dispatchEvent(new Event("change"));
+  }
+}
+
+function clearRows() {
+  rowsBody.innerHTML = "";
+}
+
+function updateCartUI() {
+  const list = document.getElementById("cart-list");
+  const count = document.getElementById("cart-count");
+  const empty = document.getElementById("cart-empty");
+  const wrap = document.getElementById("cart-list-wrapper");
+  const totalEl = document.getElementById("cart-total");
+
+  list.innerHTML = "";
+  let total = 0;
+  cart.forEach((item, idx) => {
+    total += Number(item.amount || 0);
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${item.serviceName}</td>
+      <td>${item.phone}</td>
+      <td>${item.value}</td>
+      <td>GHS ${money(item.amount)}</td>
+      <td><button class="btn btn-sm btn-outline-danger" data-remove="${idx}">Remove</button></td>
+    `;
+    list.appendChild(tr);
+  });
+
+  count.textContent = cart.length;
+  totalEl.textContent = money(total);
+  empty.classList.toggle("d-none", cart.length !== 0);
+  wrap.classList.toggle("d-none", cart.length === 0);
+}
+
+function addAllRowsToCart() {
+  const rows = Array.from(rowsBody.querySelectorAll(".card"));
+  if (rows.length === 0) {
+    alert("Add at least one row.");
+    return;
+  }
+
+  const bad = [];
+  rows.forEach((row, i) => {
+    const phone = row.querySelector(".phone-input").value.trim();
+    const selVal = row.querySelector(".offer-select").value;
+    if (!phone || phone.length < 9 || !selVal) {
+      bad.push(i + 1);
+      return;
+    }
+    const opt = row.querySelector(".offer-select").selectedOptions[0];
+const amount = Number(selVal || 0);
+const valueRaw = opt ? opt.getAttribute("data-value") : null;
+let valueObj = null;
+try { valueObj = valueRaw ? JSON.parse(valueRaw) : null; } catch (e) {}
+const valueDisplay = opt ? opt.textContent.replace(/^.*—\s*/, "") : "-";
+
+cart.push({
+  serviceId: chosenService._id_str,
+  serviceName: chosenService.name,
+  phone,
+  amount,
+  value: valueDisplay,      // for UI
+  value_obj: valueObj       // for backend (e.g., {id, volume} for API)
+});
+
+  });
+
+  if (bad.length) {
+    alert("Some rows were incomplete: " + bad.join(", "));
+  }
+
+  updateCartUI();
+  clearRows();
+  addRow();
+}
+
+function parseGBFromValue(value) {
+  if (value && typeof value === "object" && value.volume != null) {
+    const vol = Number(value.volume);
+    return vol >= 1000 ? vol / 1000 : vol / 1000; // compare in GB
+  }
+  // if string like "10GB"
+  const m = String(value || "").match(/(\d+(?:\.\d+)?)/);
+  return m ? Number(m[1]) : null;
+}
+
+function findOfferByGB(offers, gbNumber) {
+  const candidates = (offers || [])
+    .map(o => ({ o, gb: parseGBFromValue(o.value) }))
+    .filter(x => x.gb !== null && Number(x.gb) === Number(gbNumber));
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => (a.o.amount || 0) - (b.o.amount || 0));
+  return candidates[0].o;
+}
+
+
+document.querySelectorAll(".select-service-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    chosenService = JSON.parse(btn.getAttribute("data-service"));
+    chosenNameEl.textContent = chosenService.name;
+    workArea.classList.remove("d-none");
+    clearRows();
+    addRow();
+    bulkCard.classList.add("d-none");
+    bulkTrigger.value = "";
+  });
+});
+
+rowsBody.addEventListener("click", (e) => {
+  if (e.target.closest(".remove-row-btn")) {
+    e.target.closest(".col-12").remove();
+  }
+});
+
+document.getElementById("clear-rows-btn").addEventListener("click", clearRows);
+
+function showBulk() {
+  bulkCard.classList.remove("d-none");
+  setTimeout(() => document.getElementById("bulk-paste").focus(), 0);
+}
+function hideBulk() {
+  bulkCard.classList.add("d-none");
+}
+bulkTrigger.addEventListener("focus", showBulk);
+bulkTrigger.addEventListener("click", showBulk);
+hideBulkBtn.addEventListener("click", hideBulk);
+
+document.getElementById("apply-bulk-btn").addEventListener("click", () => {
+  if (!chosenService) {
+    alert("Choose a service first.");
+    return;
+  }
+  const lines = document.getElementById("bulk-paste").value.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (!lines.length) {
+    alert("Nothing to paste.");
+    return;
+  }
+
+  let needed = lines.length - rowsBody.querySelectorAll(".card").length;
+  while (needed-- > 0) addRow();
+
+  const rows = Array.from(rowsBody.querySelectorAll(".card"));
+  lines.forEach((line, i) => {
+    const parts = line.split(/[\s,;\t]+/).filter(Boolean);
+    const phone = parts[0] || "";
+    const gbNum = parts[1] ? Number(parts[1]) : null;
+
+    const row = rows[i];
+    if (!row) return;
+    const phoneInput = row.querySelector(".phone-input");
+    const sel = row.querySelector(".offer-select");
+
+    phoneInput.value = phone;
+    let selected = "";
+    if (gbNum !== null) {
+      const offer = findOfferByGB(chosenService.offers, gbNum);
+      if (offer) {
+        selected = `${offer.amount}||${offer.value}`;
+      }
+    }
+    sel.value = selected;
+    sel.dispatchEvent(new Event("change"));
+  });
+});
+
+document.getElementById("add-all-to-cart").addEventListener("click", addAllRowsToCart);
+
+document.getElementById("cartModal").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-remove]");
+  if (!btn) return;
+  const idx = Number(btn.getAttribute("data-remove"));
+  if (!Number.isNaN(idx)) {
+    cart.splice(idx, 1);
+    updateCartUI();
+  }
+});
+
+document.getElementById("clear-cart-btn").addEventListener("click", () => {
+  if (cart.length === 0) return;
+  if (confirm("Clear all items in the cart?")) {
+    cart.length = 0;
+    updateCartUI();
+  }
+});
+
+document.getElementById("checkout-btn").addEventListener("click", () => {
+  if (!cart.length) {
+    alert("Your cart is empty.");
+    return;
+  }
+
+  const section = document.getElementById("checkout-section");
+  const total = document.getElementById("cart-total").textContent;
+  document.getElementById("checkout-total").textContent = total;
+  section.classList.remove("d-none");
+
+  setTimeout(() => {
+    section.scrollIntoView({ behavior: "smooth" });
+  }, 100);
+});
+
+document.getElementById("confirm-payment-btn").addEventListener("click", async () => {
+  const method = document.getElementById("payment-method").value;
+  const total = document.getElementById("checkout-total").textContent;
+
+  const { isConfirmed } = await Swal.fire({
+    title: "Are you sure?",
+    html: `You're about to pay <b>GHS ${total}</b> from your wallet.`,
+    icon: "question",
+    showCancelButton: true,
+    confirmButtonText: "Yes, Confirm",
+    cancelButtonText: "Cancel",
+    confirmButtonColor: "#0ea5e9"
+  });
+
+  if (!isConfirmed) return;
+
+  try {
+    const response = await fetch("/checkout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cart, method })
+    });
+
+    const result = await response.json();
+
+    if (result.success) {
+      Swal.fire({ title: "✅ Success!", text: result.message, icon: "success" });
+      cart.length = 0;
+      updateCartUI();
+      document.getElementById("checkout-section").classList.add("d-none");
+      const modal = bootstrap.Modal.getInstance(document.getElementById("cartModal"));
+      modal.hide();
+    } else {
+      Swal.fire({ title: "❌ Failed", text: result.message, icon: "error" });
+    }
+  } catch (err) {
+    console.error(err);
+    Swal.fire({
+      title: "❌ Error",
+      text: "Something went wrong while processing payment.",
+      icon: "error"
+    });
+  }
+});
+function formatVolumeLabel(value) {
+  // If backend gave value_text, prefer it
+  if (value && typeof value === "string") return value;
+
+  // If value is dict {volume, id}
+  if (value && typeof value === "object") {
+    const vol = Number(value.volume || 0);
+    let label = vol >= 1000 ? `${(vol/1000).toString().replace(/\.0+$/,'')}GB` : `${vol}MB`;
+    if (value.id) label += ` (Pkg ${value.id})`;
+    return label;
+  }
+  return "-";
+}
+
+</script>
+<script>
+// …
+
+// make the "Add Row" button work
+const addRowBtn = document.getElementById("add-row-btn");
+if (addRowBtn) {
+  addRowBtn.addEventListener("click", () => addRow());
+}
+
+// (optional) also allow pressing Enter in the bulk trigger to add a row
+document.getElementById("bulk-trigger")?.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    addRow();
+  }
+});
+
+// …
+</script>
+
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+
+</body>
+</html>

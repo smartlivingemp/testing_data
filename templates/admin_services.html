@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Services - Admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    :root { --sea-blue: #0ea5e9; --dark-bg:#053047; }
+
+    @media (min-width: 992px) { .admin-content { margin-left: 260px; padding: 2rem; } }
+    @media (max-width: 991px) { .admin-content { margin-top: 1rem; padding: 1rem; } }
+
+    table thead tr th { background-color: var(--sea-blue) !important; color: #fff !important; }
+    .img-preview      { width: 64px; height: 64px; border-radius: 8px; object-fit: cover; background:#f3f6f9; }
+    .img-preview-lg   { width: 100%; height: 180px; object-fit: cover; border-radius: 10px; background:#f3f6f9; }
+    .offer-row .form-control { min-width: 100px; }
+    .btn-seablue { background-color: var(--sea-blue); border-color: var(--sea-blue); color:#fff; }
+    .btn-seablue:hover { filter: brightness(0.95); color:#fff; }
+
+    /* Mobile cards */
+    @media (max-width: 576px) {
+      .services-table-wrapper { display:none; }
+      .service-card { border:1px solid #e9ecef; border-radius:12px; padding:12px; margin-bottom:12px; }
+      .service-card .title { font-weight:600; }
+      .service-card .actions .btn { margin-right:6px; margin-top:6px; }
+    }
+    @media (min-width: 577px) { .services-cards-wrapper { display:none; } }
+
+    .small-muted { font-size:.9rem; color:#6c757d; }
+  </style>
+</head>
+<body>
+  {% include 'admin_sidebar.html' %}
+
+  <div class="admin-content">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+      <h2 class="mb-0">Services</h2>
+      <button class="btn btn-seablue" data-bs-toggle="modal" data-bs-target="#addServiceModal">+ Add Service</button>
+    </div>
+
+    <!-- Table -->
+    <div class="services-table-wrapper table-responsive">
+      <table class="table table-bordered table-hover align-middle">
+        <thead>
+          <tr>
+            <th style="width:60px;">#</th>
+            <th style="width:90px;">Image</th>
+            <th>Service Name</th>
+            <th>Offers (Amount / Value / Profit)</th>
+            <th style="width:180px;">Created</th>
+            <th style="width:170px;">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for svc in services %}
+          {% set sid = svc._id_str %}
+          <tr>
+            <td>{{ loop.index }}</td>
+            <td>
+              {% if svc.image_url %}
+                <img src="{{ svc.image_url }}" class="img-preview" alt="img">
+              {% else %}-{% endif %}
+            </td>
+            <td class="fw-semibold">{{ svc.name }}</td>
+            <td>
+              {% if svc.offers and svc.offers|length > 0 %}
+                <ul class="mb-0 ps-3">
+                  {% for of in svc.offers %}
+                    <li>
+                      <span class="badge bg-light text-dark border me-1">Amt: {{ of.amount if of.amount is not none else "-" }}</span>
+                      <span class="badge bg-light text-dark border me-1">Val: {{ of.value_text or of.value or "-" }}</span>
+                      <span class="badge bg-light text-dark border">Profit: {{ of.profit if of.profit is not none else "-" }}</span>
+                    </li>
+                  {% endfor %}
+                </ul>
+              {% else %}
+                <span class="text-muted">No offers</span>
+              {% endif %}
+            </td>
+            <td>{{ svc.created_at.strftime('%Y-%m-%d %H:%M') if svc.created_at else '-' }}</td>
+            <td>
+              <div class="d-flex gap-2">
+                <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#editServiceModal-{{ sid }}">Edit</button>
+                <form method="post" action="{{ url_for('admin_services.delete_service', service_id=sid) }}" onsubmit="return confirm('Delete this service?');">
+                  <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+          {% if services|length == 0 %}
+          <tr><td colspan="6" class="text-center">No services found.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Mobile Cards -->
+    <div class="services-cards-wrapper">
+      {% for svc in services %}
+        {% set sid = svc._id_str %}
+        <div class="service-card">
+          <div class="d-flex align-items-center">
+            {% if svc.image_url %}
+            <img src="{{ svc.image_url }}" class="img-preview me-2" alt="img">
+            {% endif %}
+            <div>
+              <div class="title">{{ svc.name }}</div>
+              <small class="text-muted">{{ svc.created_at.strftime('%Y-%m-%d %H:%M') if svc.created_at else '-' }}</small>
+            </div>
+          </div>
+          <div class="mt-2">
+            {% if svc.offers and svc.offers|length > 0 %}
+              <ul class="ps-3 mb-0">
+                {% for of in svc.offers %}
+                  <li>
+                    <span class="badge bg-light text-dark border me-1">Amt: {{ of.amount if of.amount is not none else "-" }}</span>
+<span class="badge bg-light text-dark border me-1">Val: {{ of.value_text | default(of.value) | default("-") }}</span>
+                    <span class="badge bg-light text-dark border">Profit: {{ of.profit if of.profit is not none else "-" }}</span>
+                  </li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <span class="text-muted">No offers</span>
+            {% endif %}
+          </div>
+          <div class="actions mt-2">
+            <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#editServiceModal-{{ sid }}">Edit</button>
+            <form class="d-inline" method="post" action="{{ url_for('admin_services.delete_service', service_id=sid) }}" onsubmit="return confirm('Delete this service?');">
+              <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+            </form>
+          </div>
+        </div>
+      {% endfor %}
+      {% if services|length == 0 %}<div class="text-center text-muted">No services found.</div>{% endif %}
+    </div>
+  </div>
+
+  <!-- Add Service Modal -->
+  <div class="modal fade" id="addServiceModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content">
+        <form method="post" action="{{ url_for('admin_services.create_service') }}">
+          <div class="modal-header">
+            <h5 class="modal-title">Add Service</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+
+          <div class="modal-body">
+            <!-- Image & Name -->
+            <div class="row g-3 mb-3">
+              <div class="col-md-4">
+                <img id="create_img_preview" class="img-preview-lg mb-2" src="" alt="">
+                <input type="hidden" name="image_url" id="create_image_url">
+                <div class="d-grid gap-2">
+                  <input type="file" id="create_image_file" accept="image/*" class="form-control">
+                  <small class="small-muted">Upload from your device (stored on server)</small>
+                  <div id="create_upload_status" class="small-muted"></div>
+                </div>
+              </div>
+              <div class="col-md-8">
+                <label class="form-label">Service Name</label>
+                <input type="text" name="service_name" class="form-control" placeholder="e.g., MTN" required>
+              </div>
+            </div>
+
+            <hr>
+
+            <!-- Offers -->
+            <div class="d-flex justify-content-between align-items-center mb-2">
+              <h6 class="mb-0">Offers</h6>
+              <button type="button" class="btn btn-sm btn-secondary add-offer-btn" data-target-container="#create_offers_container">+ Add Offer</button>
+            </div>
+
+            <div id="create_offers_container" class="vstack gap-2">
+              <div class="offer-row row g-2">
+                <div class="col-4 col-md-3">
+                  <input type="number" step="0.01" min="0" class="form-control" name="offers_amount[]" placeholder="Amount (e.g., 2)">
+                </div>
+                <div class="col-4 col-md-5">
+                  <input type="text" class="form-control" name="offers_value[]" placeholder="Value (e.g., 1GB)">
+                </div>
+                <div class="col-3 col-md-3">
+                  <input type="number" step="0.01" min="0" class="form-control" name="offers_profit[]" placeholder="Profit (e.g., 0.50)">
+                </div>
+                <div class="col-1 d-grid">
+                  <button type="button" class="btn btn-outline-danger remove-offer-btn">&times;</button>
+                </div>
+              </div>
+            </div>
+
+          </div>
+          <div class="modal-footer">
+            <button type="submit" class="btn btn-seablue">Save Service</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  {% for svc in services %}
+  {% set sid = svc._id_str %}
+  <!-- Edit Service Modal -->
+  <div class="modal fade" id="editServiceModal-{{ sid }}" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content">
+        <form method="post" action="{{ url_for('admin_services.update_service', service_id=sid) }}">
+          <div class="modal-header">
+            <h5 class="modal-title">Edit Service — {{ svc.name }}</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+
+          <div class="modal-body">
+            <div class="row g-3 mb-3">
+              <div class="col-md-4">
+                <img id="edit_img_preview_{{ sid }}" class="img-preview-lg mb-2" src="{{ svc.image_url or '' }}" alt="">
+                <input type="hidden" name="image_url" id="edit_image_url_{{ sid }}" value="{{ svc.image_url or '' }}">
+                <div class="d-grid gap-2">
+                  <input type="file" id="edit_image_file_{{ sid }}" accept="image/*" class="form-control edit-image-file" data-sid="{{ sid }}">
+                  <small class="small-muted">Upload from your device (stored on server)</small>
+                  <div id="edit_upload_status_{{ sid }}" class="small-muted"></div>
+                </div>
+              </div>
+              <div class="col-md-8">
+                <label class="form-label">Service Name</label>
+                <input type="text" name="service_name" value="{{ svc.name }}" class="form-control" required>
+              </div>
+            </div>
+
+            <hr>
+
+            <div class="d-flex justify-content-between align-items-center mb-2">
+              <h6 class="mb-0">Offers</h6>
+              <button type="button" class="btn btn-sm btn-secondary add-offer-btn" data-target-container="#offers_container_{{ sid }}">+ Add Offer</button>
+            </div>
+
+            <div id="offers_container_{{ sid }}" class="vstack gap-2">
+              {% if svc.offers and svc.offers|length > 0 %}
+                {% for of in svc.offers %}
+                <div class="offer-row row g-2">
+                  <div class="col-4 col-md-3">
+                    <input type="number" step="0.01" min="0" class="form-control" name="offers_amount[]" value="{{ of.amount if of.amount is not none else '' }}" placeholder="Amount">
+                  </div>
+                  <div class="col-4 col-md-5">
+                    <input type="text" class="form-control" name="offers_value[]" value="{{ of.value or '' }}" placeholder="Value">
+                  </div>
+                  <div class="col-3 col-md-3">
+                    <input type="number" step="0.01" min="0" class="form-control" name="offers_profit[]" value="{{ of.profit if of.profit is not none else '' }}" placeholder="Profit">
+                  </div>
+                  <div class="col-1 d-grid">
+                    <button type="button" class="btn btn-outline-danger remove-offer-btn">&times;</button>
+                  </div>
+                </div>
+                {% endfor %}
+              {% else %}
+                <div class="offer-row row g-2">
+                  <div class="col-4 col-md-3">
+                    <input type="number" step="0.01" min="0" class="form-control" name="offers_amount[]" placeholder="Amount">
+                  </div>
+                  <div class="col-4 col-md-5">
+                    <input type="text" class="form-control" name="offers_value[]" placeholder="Value">
+                  </div>
+                  <div class="col-3 col-md-3">
+                    <input type="number" step="0.01" min="0" class="form-control" name="offers_profit[]" placeholder="Profit">
+                  </div>
+                  <div class="col-1 d-grid">
+                    <button type="button" class="btn btn-outline-danger remove-offer-btn">&times;</button>
+                  </div>
+                </div>
+              {% endif %}
+            </div>
+          </div>
+
+          <div class="modal-footer">
+            <button type="submit" class="btn btn-seablue">Update Service</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+
+<script>
+  // Upload image to Flask /uploads folder
+  async function uploadToServer(file, { statusEl, previewEl, hiddenInputEl }) {
+    if (!file) return;
+
+    const formData = new FormData();
+    formData.append("image", file);
+    if (statusEl) statusEl.textContent = "Uploading...";
+
+    try {
+      const res = await fetch("/upload_service_image", {
+        method: "POST",
+        body: formData
+      });
+
+      const data = await res.json();
+      if (data.success) {
+        hiddenInputEl.value = data.url;
+        if (previewEl) previewEl.src = data.url;
+        if (statusEl) statusEl.textContent = "✅ Image uploaded.";
+      } else {
+        statusEl.textContent = "❌ Upload failed.";
+        console.error("Server error:", data.error);
+      }
+    } catch (err) {
+      statusEl.textContent = "❌ Upload error.";
+      console.error(err);
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    // Add Service modal upload
+    const createFile = document.getElementById("create_image_file");
+    const createHidden = document.getElementById("create_image_url");
+    const createPrev = document.getElementById("create_img_preview");
+    const createStat = document.getElementById("create_upload_status");
+
+    if (createFile) {
+      createFile.addEventListener("change", (e) => {
+        const file = e.target.files[0];
+        uploadToServer(file, {
+          statusEl: createStat,
+          previewEl: createPrev,
+          hiddenInputEl: createHidden
+        });
+      });
+    }
+
+    // Reset add modal on open
+    const addModal = document.getElementById("addServiceModal");
+    if (addModal) {
+      addModal.addEventListener("show.bs.modal", () => {
+        createHidden.value = "";
+        createPrev.src = "";
+        createStat.textContent = "";
+        const cont = document.getElementById("create_offers_container");
+        if (cont) {
+          cont.innerHTML = `
+            <div class="offer-row row g-2">
+              <div class="col-4 col-md-3">
+                <input type="number" step="0.01" min="0" class="form-control" name="offers_amount[]" placeholder="Amount (e.g., 2)">
+              </div>
+              <div class="col-4 col-md-5">
+                <input type="text" class="form-control" name="offers_value[]" placeholder="Value (e.g., 1GB)">
+              </div>
+              <div class="col-3 col-md-3">
+                <input type="number" step="0.01" min="0" class="form-control" name="offers_profit[]" placeholder="Profit (e.g., 0.50)">
+              </div>
+              <div class="col-1 d-grid">
+                <button type="button" class="btn btn-outline-danger remove-offer-btn">&times;</button>
+              </div>
+            </div>
+          `;
+        }
+      });
+    }
+
+    // Handle edit modals
+    document.addEventListener("change", function (e) {
+      if (e.target.classList.contains("edit-image-file")) {
+        const sid = e.target.dataset.sid;
+        const file = e.target.files[0];
+        const previewEl = document.getElementById(`edit_img_preview_${sid}`);
+        const hiddenInputEl = document.getElementById(`edit_image_url_${sid}`);
+        const statusEl = document.getElementById(`edit_upload_status_${sid}`);
+
+        uploadToServer(file, {
+          statusEl,
+          previewEl,
+          hiddenInputEl
+        });
+      }
+    });
+
+    // Add-offer buttons
+    document.querySelectorAll(".add-offer-btn").forEach(addBtn => {
+      const containerSel = addBtn.getAttribute("data-target-container");
+      addBtn.addEventListener("click", function () {
+        const cont = document.querySelector(containerSel);
+        if (!cont) return;
+        const row = document.createElement("div");
+        row.className = "offer-row row g-2";
+        row.innerHTML = `
+          <div class="col-4 col-md-3">
+            <input type="number" step="0.01" min="0" class="form-control" name="offers_amount[]" placeholder="Amount">
+          </div>
+          <div class="col-4 col-md-5">
+            <input type="text" class="form-control" name="offers_value[]" placeholder="Value">
+          </div>
+          <div class="col-3 col-md-3">
+            <input type="number" step="0.01" min="0" class="form-control" name="offers_profit[]" placeholder="Profit">
+          </div>
+          <div class="col-1 d-grid">
+            <button type="button" class="btn btn-outline-danger remove-offer-btn">&times;</button>
+          </div>
+        `;
+        cont.appendChild(row);
+      });
+    });
+
+    // Remove-offer buttons
+    document.body.addEventListener("click", function (e) {
+      if (e.target.classList.contains("remove-offer-btn")) {
+        const row = e.target.closest(".offer-row");
+        const container = row?.parentElement;
+        if (row && container) {
+          if (container.children.length > 1) row.remove();
+          else row.querySelectorAll("input").forEach(i => i.value = "");
+        }
+      }
+    });
+  });
+</script>
+
+</body>
+</html>
