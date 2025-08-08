@@ -6,7 +6,7 @@ from admin_dashboard import admin_dashboard_bp
 from login import login_bp
 from signup import signup_bp
 from admin_customers import admin_customers_bp
-from admin_services import admin_services_bp  # Includes upload route
+from admin_services import admin_services_bp
 from deposit import deposit_bp
 from checkout import checkout_bp
 from orders import orders_bp
@@ -25,17 +25,14 @@ from purchase_checker import purchase_checker_bp
 from admin_purchases import admin_purchases_bp
 from settings import settings_bp
 
-
-# === Configuration ===
-UPLOAD_FOLDER = os.path.join(os.getcwd(), 'uploads')
+UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads")
 
 def create_app():
     app = Flask(__name__)
-    app.secret_key = "your-secret-key"  # 🔐 Move this to an environment variable in production
+    app.secret_key = os.getenv("SECRET_KEY", "change-me")  # set on Render
 
-    # Ensure the upload folder exists
-    if not os.path.exists(UPLOAD_FOLDER):
-        os.makedirs(UPLOAD_FOLDER)
+    # Ensure uploads folder exists (note: Render disk is ephemeral unless you add a Persistent Disk)
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
     # Register Blueprints
     app.register_blueprint(customer_dashboard_bp)
@@ -62,20 +59,24 @@ def create_app():
     app.register_blueprint(settings_bp)
     app.register_blueprint(admin_purchases_bp)
 
-
-
-    # Home route
     @app.route("/")
     def home():
         return render_template("index.html")
 
-    # Serve uploaded files
     @app.route("/uploads/<path:filename>")
     def uploaded_file(filename):
         return send_from_directory(UPLOAD_FOLDER, filename)
 
+    # Simple health check for Render
+    @app.route("/healthz")
+    def healthz():
+        return "ok", 200
+
     return app
 
+# ✅ Expose a module-level app for Gunicorn (`gunicorn app:app`)
+app = create_app()
+
 if __name__ == "__main__":
-    app = create_app()
+    # Local dev only; Render uses Gunicorn
     app.run(debug=True)
