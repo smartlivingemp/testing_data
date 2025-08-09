@@ -1,8 +1,8 @@
-# checkout.py — live Toppily calls + custom CA bundle + optional cloudscraper fallback
+# checkout.py — live Toppily (network/shared_bundle), custom CA bundle, optional cloudscraper
 from flask import Blueprint, request, jsonify, session
 from bson import ObjectId
 from datetime import datetime
-import os, uuid, random, time, requests, certifi, traceback, json, hashlib, pathlib, shutil
+import os, uuid, random, requests, certifi, traceback, json, hashlib, pathlib, shutil
 
 from db import db
 
@@ -18,17 +18,23 @@ services_col = db["services"]
 # Toppily config (HARD-CODED)
 # ===========================
 TOPPILY_URL = "https://toppily.com/api/v1/buy-other-package"
-TOPPILY_API_KEY = "0e7434520859996d4b758c7c77e22013690fc9ae"  # <-- put your real key in quotes
+TOPPILY_API_KEY = "0e7434520859996d4b758c7c77e22013690fc9ae"  # <-- your key (keep it secret!)
 
 # TLS + CF toggles
 USE_CUSTOM_CA_BUNDLE = True      # build certifi + (optional) intermediate below
 USE_CLOUDSCRAPER_FALLBACK = True # try cloudscraper if CF challenge page is detected (temporary/brittle)
 PRIMARY_VERIFY_SSL = True        # keep True for proper security
 
-# OPTIONAL: paste the provider's missing intermediate certificate (PEM) here if you have it.
-# If you don't have it yet, leave the string empty; the code still works with pure certifi.
+# OPTIONAL: paste missing intermediate PEM if provider's chain is incomplete (can leave empty)
 TOPPILY_INTERMEDIATE_PEM = r"""
-"""  # <-- paste PEM including -----BEGIN CERTIFICATE----- lines, or leave empty.
+"""
+
+# Optional last-resort mapping (only used if we cannot find network_id anywhere else)
+NETWORK_ID_FALLBACK = {
+    "MTN": 3,          # <- adjust to real IDs you received from Toppily
+    "VODAFONE": 2,
+    "AIRTELTIGO": 1,
+}
 
 # ===========================
 # Startup: build CA bundle
@@ -83,10 +89,8 @@ def _money(v):
         return 0.0
 
 def _is_cloudflare_block(text: str, headers: dict, status: int) -> bool:
-    # Fast heuristics for CF challenge pages
     if "Just a moment..." in text or "__cf_chl_" in text or "challenge-platform" in text:
         return status in (403, 503)
-    # headers can be useful, but some setups strip them; body heuristics suffice here
     return False
 
 def _resp_debug(resp: requests.Response, body_text: str):
@@ -140,13 +144,74 @@ def _post_cloudscraper(body):
     ok = resp.ok and bool(data.get("success", False))
     return ok, data, resp, text
 
-def _send_toppily_by_package(phone: str, package_id: int, trx_ref: str, order_id: str, debug_events: list):
+# ---------------------------
+# Build body for SHARED BUNDLE flow
+# ---------------------------
+def _resolve_network_id(item: dict, value_obj: dict):
+    # 1) direct from payload
+    nid = (item or {}).get("network_id") or (value_obj or {}).get("network_id")
+    if nid not in (None, "", []):
+        try:
+            return int(nid)
+        except Exception:
+            pass
+
+    # 2) lookup via services collection using serviceId
+    svc_id = (item or {}).get("serviceId")
+    if svc_id:
+        try:
+            svc_doc = services_col.find_one({"_id": ObjectId(svc_id)}, {"network_id": 1, "name": 1, "network": 1})
+            if svc_doc and "network_id" in svc_doc and svc_doc["network_id"] not in (None, ""):
+                return int(svc_doc["network_id"])
+            # fallback from service doc's name if present
+            guess = (svc_doc.get("name") or svc_doc.get("network") or "").strip().upper() if svc_doc else ""
+            if guess and guess in NETWORK_ID_FALLBACK:
+                return int(NETWORK_ID_FALLBACK[guess])
+        except Exception:
+            # ignore lookup errors; try name map
+            pass
+
+    # 3) last-resort from serviceName
+    name = (item.get("serviceName") or "").strip().upper()
+    if name in NETWORK_ID_FALLBACK:
+        return int(NETWORK_ID_FALLBACK[name])
+
+    return None
+
+def _resolve_shared_bundle(item: dict, value_obj: dict):
+    # Prefer value_obj.volume (your offers structure) e.g., 1000, 2000, ...
+    vol = (value_obj or {}).get("volume")
+    if vol not in (None, "", []):
+        try:
+            return int(vol)
+        except Exception:
+            pass
+    # allow an explicit item.shared_bundle override
+    sb = (item or {}).get("shared_bundle")
+    if sb not in (None, "", []):
+        try:
+            return int(sb)
+        except Exception:
+            pass
+    return None
+
+def _send_toppily_shared_bundle(phone: str, network_id: int, shared_bundle: int, trx_ref: str,
+                                order_id: str, debug_events: list):
+    """
+    Calls Toppily with {recipient_msisdn, network_id, shared_bundle, trx_ref}.
+    Returns (success: bool, payload: dict).
+    """
     if not TOPPILY_API_KEY.strip():
         err = {"success": False, "message": "API key not set", "http_status": 500}
         jlog("toppily_config_error", order_id=order_id, trx_ref=trx_ref)
         return False, err
 
-    body = {"recipient_msisdn": phone, "package_id": int(package_id), "trx_ref": trx_ref}
+    body = {
+        "recipient_msisdn": phone,
+        "network_id": int(network_id),
+        "shared_bundle": int(shared_bundle),
+        "trx_ref": trx_ref,
+    }
 
     # 1) Primary: verified TLS (with our CA bundle)
     try:
@@ -181,7 +246,7 @@ def _send_toppily_by_package(phone: str, package_id: int, trx_ref: str, order_id
 
     except requests.exceptions.SSLError as e:
         jlog("toppily_ssl_error", order_id=order_id, trx_ref=trx_ref, error=str(e))
-        # If TLS fails even with our bundle, you can temporarily drop to verify=False to inspect origin.
+        # If TLS fails even with our bundle, drop to verify=False to inspect origin.
         try:
             ok, data, resp, text = _post_requests(body, False)
             dbg = _resp_debug(resp, text)
@@ -258,34 +323,31 @@ def process_checkout():
         if current_balance < total_requested:
             return jsonify({"success": False, "message": "❌ Insufficient wallet balance"}), 400
 
-        # 🚀 Call provider item-by-item
+        # 🚀 Call provider item-by-item (network/shared_bundle only)
         results, total_success_amount, debug_events = [], 0.0, []
 
         for idx, item in enumerate(cart, start=1):
             phone = (item.get("phone") or "").strip()
             value_obj = item.get("value_obj") or {}
-            pkg_id = value_obj.get("id")
             amt = _money(item.get("amount"))
 
-            if not phone or pkg_id in (None, "", []):
+            # Resolve inputs for Toppily body
+            network_id = _resolve_network_id(item, value_obj)
+            shared_bundle = _resolve_shared_bundle(item, value_obj)
+
+            if not phone or network_id is None or shared_bundle is None:
                 results.append({
                     "phone": phone, "amount": amt, "value": item.get("value"),
                     "value_obj": value_obj, "api_status": "skipped",
-                    "api_response": {"error": "Missing phone or package_id"}
+                    "api_response": {
+                        "error": "Missing phone, network_id, or shared_bundle (volume).",
+                        "got": {"phone": bool(phone), "network_id": network_id, "shared_bundle": shared_bundle}
+                    }
                 })
                 continue
 
-            try:
-                pkg_id = int(pkg_id)
-            except Exception:
-                results.append({
-                    "phone": phone, "amount": amt, "value": item.get("value"),
-                    "value_obj": value_obj, "api_status": "skipped",
-                    "api_response": {"error": f"package_id must be int, got {value_obj.get('id')!r}"} })
-                continue
-
             trx_ref = f"{order_id}_{idx}_{uuid.uuid4().hex[:6]}"
-            ok, payload = _send_toppily_by_package(phone, pkg_id, trx_ref, order_id, debug_events)
+            ok, payload = _send_toppily_shared_bundle(phone, network_id, shared_bundle, trx_ref, order_id, debug_events)
 
             results.append({
                 "phone": phone, "amount": amt, "value": item.get("value"),
@@ -355,4 +417,3 @@ def process_checkout():
     except Exception:
         jlog("checkout_uncaught", error=traceback.format_exc())
         return jsonify({"success": False, "message": "Server error"}), 500
-
