@@ -18,7 +18,7 @@ services_col = db["services"]
 # Toppily config (HARD-CODED)
 # ===========================
 TOPPILY_URL = "https://toppily.com/api/v1/buy-other-package"
-TOPPILY_API_KEY = "REPLACE_WITH_YOUR_REAL_TOPPILY_API_KEY"  # <-- put your real key in quotes
+TOPPILY_API_KEY = "0e7434520859996d4b758c7c77e22013690fc9ae"  # <-- put your real key in quotes
 
 # TLS + CF toggles
 USE_CUSTOM_CA_BUNDLE = True      # build certifi + (optional) intermediate below
@@ -355,3 +355,4 @@ def process_checkout():
     except Exception:
         jlog("checkout_uncaught", error=traceback.format_exc())
         return jsonify({"success": False, "message": "Server error"}), 500
+
