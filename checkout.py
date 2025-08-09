@@ -5,8 +5,10 @@ from datetime import datetime
 import os
 import uuid
 import random
+import time
 import requests
 import certifi
+import traceback
 
 from db import db
 
@@ -18,13 +20,12 @@ orders_col = db["orders"]
 transactions_col = db["transactions"]
 services_col = db["services"]  # reserved for future lookups
 
-# --- Toppily config ---
+# --- Toppily config (HARD-CODED; no envs) ---
 TOPPILY_URL = "https://toppily.com/api/v1/buy-other-package"
-TOPPILY_API_KEY = os.getenv("TOPPILY_API_KEY", "").strip()
-TOPPILY_MOCK = os.getenv("TOPPILY_MOCK", "0").lower() in ("1", "true", "yes")
-TOPPILY_VERIFY_SSL = os.getenv("TOPPILY_VERIFY_SSL", "1").lower() in ("1", "true", "yes")
+TOPPILY_API_KEY = "0e7434520859996d4b758c7c77e22013690fc9ae"  # <-- put your key here
+TOPPILY_VERIFY_SSL = True  # set to False TEMPORARILY only if you face cert issues
 
-# Force Requests & OpenSSL to use certifi’s bundle (helps on Render)
+# Prefer certifi's CA bundle (helps on some hosts)
 try:
     ca_path = certifi.where()
     os.environ.setdefault("SSL_CERT_FILE", ca_path)
@@ -48,20 +49,10 @@ def _send_toppily_by_package(phone: str, package_id: int, trx_ref: str):
     Call Toppily with {recipient_msisdn, package_id, trx_ref}.
     Returns (success: bool, payload: dict) where payload includes parsed response + http_status.
     """
-    # MOCK: simulate success/failure without calling Toppily
-    if TOPPILY_MOCK:
-        ok = int(package_id) % 2 == 0  # even ids succeed (lets you test partials)
-        sim = {
-            "success": ok,
-            "message": "Simulated Toppily response (MOCK)",
-            "transaction_code": f"mock_{uuid.uuid4().hex[:10]}",
-            "http_status": 200 if ok else 422,
-            "package_id": int(package_id),
-            "recipient_msisdn": phone,
-            "trx_ref": trx_ref,
-        }
-        print("[TOPPILY:MOCK]", sim)
-        return ok, sim
+    if not TOPPILY_API_KEY.strip():
+        err = {"success": False, "message": "TOPPILY_API_KEY is not set.", "http_status": 500}
+        print("[TOPPILY:CONFIG ERROR]", err)
+        return False, err
 
     headers = {
         "x-api-key": TOPPILY_API_KEY,
@@ -74,198 +65,203 @@ def _send_toppily_by_package(phone: str, package_id: int, trx_ref: str):
         "trx_ref": trx_ref,
     }
 
-    if not TOPPILY_API_KEY:
-        err = {"success": False, "message": "Missing TOPPILY_API_KEY env", "http_status": 500}
-        print("[TOPPILY:CONFIG ERROR]", err)
-        return False, err
-
-    try:
-        resp = requests.post(
-            TOPPILY_URL,
-            headers=headers,
-            json=body,
-            timeout=35,
-            verify=(certifi.where() if TOPPILY_VERIFY_SSL else False),
-        )
-        text = resp.text or ""
+    # simple retry on transient network errors or 5xx
+    for attempt in range(1, 3 + 1):
         try:
-            data = resp.json()
-        except Exception:
-            data = {"raw": text}
+            resp = requests.post(
+                TOPPILY_URL,
+                headers=headers,
+                json=body,
+                timeout=35,
+                verify=(certifi.where() if TOPPILY_VERIFY_SSL else False),
+            )
+            text = resp.text or ""
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"raw": text}
 
-        payload = {**data, "http_status": resp.status_code}
-        print("[TOPPILY]", resp.status_code, payload)  # visible in Render logs
+            payload = {**data, "http_status": resp.status_code}
+            print(f"[TOPPILY][try {attempt}] {resp.status_code} -> {payload}")
 
-        ok = resp.ok and bool(data.get("success", False))
-        return ok, payload
+            ok = resp.ok and bool(data.get("success", False))
+            return ok, payload
 
-    except requests.exceptions.SSLError as e:
-        err = {
-            "success": False,
-            "error": f"SSL error: {e}",
-            "hint": "Cert verification failed. Using certifi bundle. If this persists, Toppily may need to fix their TLS chain. "
-                    "TEMPORARY ONLY: set TOPPILY_VERIFY_SSL=0 to bypass.",
-            "http_status": 597,
-        }
-        print("[TOPPILY:SSL ERROR]", err)
-        return False, err
-    except requests.RequestException as e:
-        err = {"success": False, "error": str(e), "http_status": 599}
-        print("[TOPPILY:EXCEPTION]", err)
-        return False, err
+        except requests.exceptions.SSLError as e:
+            err = {
+                "success": False,
+                "error": f"SSL error: {e}",
+                "hint": "Certificate verification failed. If you trust the endpoint and need to confirm, "
+                        "TEMPORARILY set TOPPILY_VERIFY_SSL=False above (do not leave it disabled).",
+                "http_status": 597,
+            }
+            print("[TOPPILY:SSL ERROR]", err)
+            return False, err
+        except requests.RequestException as e:
+            # Retry on last; otherwise return error
+            print(f"[TOPPILY:EXCEPTION try {attempt}] {e}")
+            if attempt == 3:
+                return False, {"success": False, "error": str(e), "http_status": 599}
+            time.sleep(1.5)
 
 @checkout_bp.route("/checkout", methods=["POST"])
 def process_checkout():
-    # 🔐 Auth
-    if "user_id" not in session or session.get("role") != "customer":
-        return jsonify({"success": False, "message": "Not authorized"}), 401
-
-    # Validate session user id
     try:
-        user_id = ObjectId(session["user_id"])
-    except Exception:
-        return jsonify({"success": False, "message": "Invalid user ID"}), 400
+        # 🔐 Auth
+        if "user_id" not in session or session.get("role") != "customer":
+            print("[CHECKOUT] Auth failed. Session keys:", list(session.keys()))
+            return jsonify({"success": False, "message": "Not authorized"}), 401
 
-    data = request.get_json(silent=True) or {}
-    cart = data.get("cart", [])
-    method = data.get("method", "wallet")
-
-    # 🛒 Validate cart
-    if not cart or not isinstance(cart, list):
-        return jsonify({"success": False, "message": "Cart is empty or invalid"}), 400
-
-    # 💰 Compute totals from cart
-    total_requested = 0.0
-    for item in cart:
-        total_requested += _money(item.get("amount"))
-
-    if total_requested <= 0:
-        return jsonify({"success": False, "message": "Total amount must be greater than zero"}), 400
-
-    # 🧾 Generate order ID & per-item refs
-    order_id = generate_order_id()
-
-    # 🏦 Check wallet balance up-front (must cover full cart to proceed)
-    bal_doc = balances_col.find_one({"user_id": user_id}) or {}
-    current_balance = _money(bal_doc.get("amount", 0))
-    if current_balance < total_requested:
-        return jsonify({"success": False, "message": "❌ Insufficient wallet balance"}), 400
-
-    # 🚀 Call Toppily for each item by package_id
-    results = []
-    total_success_amount = 0.0
-
-    for idx, item in enumerate(cart, start=1):
-        phone = (item.get("phone") or "").strip()
-        value_obj = item.get("value_obj") or {}   # expected: {"id": <package_id>, ...}
-        pkg_id = value_obj.get("id")
-
-        if not phone or pkg_id in (None, "", []):
-            results.append({
-                "phone": phone,
-                "amount": _money(item.get("amount")),
-                "value": item.get("value"),
-                "value_obj": value_obj,
-                "api_status": "skipped",
-                "api_response": {"error": "Missing phone or package_id"}
-            })
-            continue
-
-        # Ensure pkg_id is int
+        # Validate session user id
         try:
-            pkg_id = int(pkg_id)
+            user_id = ObjectId(session["user_id"])
         except Exception:
+            return jsonify({"success": False, "message": "Invalid user ID"}), 400
+
+        data = request.get_json(silent=True) or {}
+        cart = data.get("cart", [])
+        method = data.get("method", "wallet")
+        print("[CHECKOUT] Incoming payload:", data)
+
+        # 🛒 Validate cart
+        if not cart or not isinstance(cart, list):
+            return jsonify({"success": False, "message": "Cart is empty or invalid"}), 400
+
+        # 💰 Compute totals from cart
+        total_requested = sum(_money(item.get("amount")) for item in cart)
+        if total_requested <= 0:
+            return jsonify({"success": False, "message": "Total amount must be greater than zero"}), 400
+
+        # 🧾 Generate order ID & per-item refs
+        order_id = generate_order_id()
+
+        # 🏦 Check wallet balance up-front (must cover full cart to proceed)
+        bal_doc = balances_col.find_one({"user_id": user_id}) or {}
+        current_balance = _money(bal_doc.get("amount", 0))
+        print(f"[CHECKOUT] Balance={current_balance} TotalRequested={total_requested}")
+
+        if current_balance < total_requested:
+            return jsonify({"success": False, "message": "❌ Insufficient wallet balance"}), 400
+
+        # 🚀 Call Toppily for each item by package_id
+        results = []
+        total_success_amount = 0.0
+
+        for idx, item in enumerate(cart, start=1):
+            phone = (item.get("phone") or "").strip()
+            value_obj = item.get("value_obj") or {}   # expected: {"id": <package_id>, ...}
+            pkg_id = value_obj.get("id")
+            amt = _money(item.get("amount"))
+
+            if not phone or pkg_id in (None, "", []):
+                results.append({
+                    "phone": phone,
+                    "amount": amt,
+                    "value": item.get("value"),
+                    "value_obj": value_obj,
+                    "api_status": "skipped",
+                    "api_response": {"error": "Missing phone or package_id"}
+                })
+                continue
+
+            # Ensure pkg_id is int
+            try:
+                pkg_id = int(pkg_id)
+            except Exception:
+                results.append({
+                    "phone": phone,
+                    "amount": amt,
+                    "value": item.get("value"),
+                    "value_obj": value_obj,
+                    "api_status": "skipped",
+                    "api_response": {"error": f"package_id must be int, got {value_obj.get('id')!r}"} })
+                continue
+
+            trx_ref = f"{order_id}_{idx}_{uuid.uuid4().hex[:6]}"
+            ok, payload = _send_toppily_by_package(phone, pkg_id, trx_ref)
+            print(f"[CHECKOUT] Item {idx}: ok={ok} pkg_id={pkg_id} phone={phone} payload={payload}")
+
             results.append({
                 "phone": phone,
-                "amount": _money(item.get("amount")),
+                "amount": amt,
                 "value": item.get("value"),
                 "value_obj": value_obj,
-                "api_status": "skipped",
-                "api_response": {"error": f"package_id must be int, got {value_obj.get('id')!r}"}
+                "serviceId": item.get("serviceId"),
+                "serviceName": item.get("serviceName"),
+                "trx_ref": trx_ref,
+                "api_status": "success" if ok else "failed",
+                "api_response": payload
             })
-            continue
 
-        trx_ref = f"{order_id}_{idx}_{uuid.uuid4().hex[:6]}"
+            if ok:
+                total_success_amount += amt
 
-        ok, payload = _send_toppily_by_package(phone, pkg_id, trx_ref)
+        # 🧮 If nothing succeeded, do not charge; log and return 502 with reasons
+        if total_success_amount <= 0:
+            orders_col.insert_one({
+                "user_id": user_id,
+                "order_id": order_id,
+                "items": results,
+                "total_amount": total_requested,
+                "charged_amount": 0.0,
+                "status": "failed",
+                "paid_from": method,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            })
+            return jsonify({
+                "success": False,
+                "message": "No items were processed successfully. You were not charged.",
+                "order_id": order_id,
+                "details": results  # includes per-item api_response + http_status
+            }), 502
 
-        results.append({
-            "phone": phone,
-            "amount": _money(item.get("amount")),
-            "value": item.get("value"),
-            "value_obj": value_obj,
-            "serviceId": item.get("serviceId"),
-            "serviceName": item.get("serviceName"),
-            "trx_ref": trx_ref,
-            "api_status": "success" if ok else "failed",
-            "api_response": payload
-        })
+        # 💳 Charge only for successful items
+        balances_col.update_one(
+            {"user_id": user_id},
+            {"$inc": {"amount": -total_success_amount}, "$set": {"updated_at": datetime.utcnow()}},
+            upsert=True
+        )
 
-        if ok:
-            total_success_amount += _money(item.get("amount"))
-
-    # 🧮 If nothing succeeded, do not charge; log and return 502 with reasons
-    if total_success_amount <= 0:
+        # 🧾 Record order with per-item statuses
+        status = "completed" if total_success_amount == total_requested else "partial"
         orders_col.insert_one({
             "user_id": user_id,
             "order_id": order_id,
             "items": results,
-            "total_amount": total_requested,
-            "charged_amount": 0.0,
-            "status": "failed",
+            "total_amount": total_requested,        # requested total
+            "charged_amount": total_success_amount, # actually charged
+            "status": status,
             "paid_from": method,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
         })
+
+        # 🧾 Transaction record (only for charged amount)
+        transactions_col.insert_one({
+            "user_id": user_id,
+            "amount": total_success_amount,
+            "reference": order_id,
+            "status": "success",
+            "type": "purchase",
+            "gateway": "Wallet",
+            "currency": "GHS",
+            "created_at": datetime.utcnow(),
+            "verified_at": datetime.utcnow(),
+            "meta": {"order_status": status}
+        })
+
+        # 🎉 Response
+        msg = "✅ Order completed." if status == "completed" else "⚠️ Order partially completed. You were charged only for successful items."
         return jsonify({
-            "success": False,
-            "message": "No items were processed successfully. You were not charged.",
+            "success": True,
+            "message": f"{msg} Order ID: {order_id}",
             "order_id": order_id,
-            "details": results  # includes per-item api_response + http_status
-        }), 502
+            "status": status,
+            "charged_amount": round(total_success_amount, 2),
+            "items": results
+        }), 200
 
-    # 💳 Charge only for successful items
-    balances_col.update_one(
-        {"user_id": user_id},
-        {"$inc": {"amount": -total_success_amount}, "$set": {"updated_at": datetime.utcnow()}},
-        upsert=True
-    )
-
-    # 🧾 Record order with per-item statuses
-    status = "completed" if total_success_amount == total_requested else "partial"
-    orders_col.insert_one({
-        "user_id": user_id,
-        "order_id": order_id,
-        "items": results,
-        "total_amount": total_requested,        # requested total
-        "charged_amount": total_success_amount, # actually charged
-        "status": status,
-        "paid_from": method,
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
-    })
-
-    # 🧾 Transaction record (only for charged amount)
-    transactions_col.insert_one({
-        "user_id": user_id,
-        "amount": total_success_amount,
-        "reference": order_id,
-        "status": "success",
-        "type": "purchase",
-        "gateway": "Wallet",
-        "currency": "GHS",
-        "created_at": datetime.utcnow(),
-        "verified_at": datetime.utcnow(),
-        "meta": {"order_status": status}
-    })
-
-    # 🎉 Response
-    msg = "✅ Order completed." if status == "completed" else "⚠️ Order partially completed. You were charged only for successful items."
-    return jsonify({
-        "success": True,
-        "message": f"{msg} Order ID: {order_id}",
-        "order_id": order_id,
-        "status": status,
-        "charged_amount": round(total_success_amount, 2),
-        "items": results
-    }), 200
+    except Exception:
+        print("[CHECKOUT] Uncaught error:\n", traceback.format_exc())
+        return jsonify({"success": False, "message": "Server error"}), 500
