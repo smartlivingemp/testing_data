@@ -1,8 +1,9 @@
-# checkout.py
+# checkout.py — live Toppily calls + custom CA bundle + optional cloudscraper fallback
 from flask import Blueprint, request, jsonify, session
 from bson import ObjectId
 from datetime import datetime
-import os, uuid, random, time, requests, certifi, traceback
+import os, uuid, random, time, requests, certifi, traceback, json, hashlib, pathlib, shutil
+
 from db import db
 
 checkout_bp = Blueprint("checkout", __name__)
@@ -13,22 +14,65 @@ orders_col = db["orders"]
 transactions_col = db["transactions"]
 services_col = db["services"]
 
-# --- Toppily config (HARD-CODED) ---
+# ===========================
+# Toppily config (HARD-CODED)
+# ===========================
 TOPPILY_URL = "https://toppily.com/api/v1/buy-other-package"
-TOPPILY_API_KEY = "0e7434520859996d4b758c7c77e22013690fc9ae"  # <-- put your key here
-TOPPILY_VERIFY_SSL = True       # primary behavior
-ALLOW_INSECURE_TLS_FALLBACK = True  # if cert verify fails, retry once with verify=False
+TOPPILY_API_KEY = "REPLACE_WITH_YOUR_REAL_TOPPILY_API_KEY"  # <-- put your real key in quotes
 
-# Prefer certifi's CA bundle
-try:
-    ca_path = certifi.where()
-    os.environ.setdefault("SSL_CERT_FILE", ca_path)
-    os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_path)
-    print("[SSL] Using CA bundle:", ca_path)
-except Exception as _e:
-    print("[SSL] Could not set CA envs:", _e)
+# TLS + CF toggles
+USE_CUSTOM_CA_BUNDLE = True      # build certifi + (optional) intermediate below
+USE_CLOUDSCRAPER_FALLBACK = True # try cloudscraper if CF challenge page is detected (temporary/brittle)
+PRIMARY_VERIFY_SSL = True        # keep True for proper security
 
-# --- Helpers ---
+# OPTIONAL: paste the provider's missing intermediate certificate (PEM) here if you have it.
+# If you don't have it yet, leave the string empty; the code still works with pure certifi.
+TOPPILY_INTERMEDIATE_PEM = r"""
+"""  # <-- paste PEM including -----BEGIN CERTIFICATE----- lines, or leave empty.
+
+# ===========================
+# Startup: build CA bundle
+# ===========================
+def _setup_custom_ca_bundle():
+    if not USE_CUSTOM_CA_BUNDLE:
+        return certifi.where()
+    try:
+        ca_dir = pathlib.Path(os.getcwd()) / "vendor_certs"
+        ca_dir.mkdir(parents=True, exist_ok=True)
+        base_ca = certifi.where()
+        custom_ca = ca_dir / "custom_ca_bundle.pem"
+
+        with open(custom_ca, "wb") as out:
+            with open(base_ca, "rb") as base:
+                shutil.copyfileobj(base, out)
+            pem = TOPPILY_INTERMEDIATE_PEM.strip().encode("utf-8")
+            if pem:
+                out.write(b"\n")
+                out.write(pem)
+
+        os.environ["SSL_CERT_FILE"] = str(custom_ca)
+        os.environ["REQUESTS_CA_BUNDLE"] = str(custom_ca)
+        print("[SSL] Using custom CA bundle:", custom_ca)
+        return str(custom_ca)
+    except Exception as e:
+        print("[SSL] Failed to build custom CA bundle:", e)
+        return certifi.where()
+
+_CA_BUNDLE = _setup_custom_ca_bundle()
+
+# ===========================
+# Tiny JSON logger (one-line)
+# ===========================
+def jlog(event: str, **kv):
+    rec = {"evt": event, **kv}
+    try:
+        print(json.dumps(rec, ensure_ascii=False, separators=(",", ":")))
+    except Exception:
+        print(f"[LOG_FALLBACK] {event} {kv}")
+
+# ===========================
+# Helpers
+# ===========================
 def generate_order_id():
     return f"NAN{random.randint(10000, 99999)}"
 
@@ -38,84 +82,149 @@ def _money(v):
     except Exception:
         return 0.0
 
-def _post_toppily(body, verify):
+def _is_cloudflare_block(text: str, headers: dict, status: int) -> bool:
+    # Fast heuristics for CF challenge pages
+    if "Just a moment..." in text or "__cf_chl_" in text or "challenge-platform" in text:
+        return status in (403, 503)
+    # headers can be useful, but some setups strip them; body heuristics suffice here
+    return False
+
+def _resp_debug(resp: requests.Response, body_text: str):
+    redacted_headers = {}
+    for k, v in resp.headers.items():
+        lk = k.lower()
+        redacted_headers[k] = "***" if lk in ("authorization", "cookie", "set-cookie", "x-api-key") else v
+    return {
+        "status": resp.status_code,
+        "headers": redacted_headers,
+        "body_len": len(body_text or ""),
+        "body_sha256_16": hashlib.sha256((body_text or "").encode("utf-8", "ignore")).hexdigest()[:16],
+        "body_snippet": (body_text or "")[:140].replace("\n", " "),
+    }
+
+def _post_requests(body, verify):
     headers = {
         "x-api-key": TOPPILY_API_KEY,
         "Accept": "application/json",
         "Content-Type": "application/json",
+        "User-Agent": "NanDataApp/1.0 (+server)",
     }
-    resp = requests.post(
-        TOPPILY_URL,
-        headers=headers,
-        json=body,
-        timeout=35,
-        verify=verify,
-    )
+    resp = requests.post(TOPPILY_URL, headers=headers, json=body, timeout=45, verify=verify)
     text = resp.text or ""
     try:
         data = resp.json()
     except Exception:
         data = {"raw": text}
-    payload = {**data, "http_status": resp.status_code}
     ok = resp.ok and bool(data.get("success", False))
-    return ok, payload
+    return ok, data, resp, text
 
-def _send_toppily_by_package(phone: str, package_id: int, trx_ref: str):
-    """
-    Calls Toppily with {recipient_msisdn, package_id, trx_ref}.
-    Returns (success: bool, payload: dict).
-    """
+def _post_cloudscraper(body):
+    # Optional CF workaround—only use temporarily
+    try:
+        import cloudscraper
+    except Exception as e:
+        return False, {"success": False, "error": f"cloudscraper not installed: {e}"}, None, ""
+
+    scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+    headers = {
+        "x-api-key": TOPPILY_API_KEY,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    resp = scraper.post(TOPPILY_URL, headers=headers, json=body, timeout=60)
+    text = resp.text or ""
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw": text}
+    ok = resp.ok and bool(data.get("success", False))
+    return ok, data, resp, text
+
+def _send_toppily_by_package(phone: str, package_id: int, trx_ref: str, order_id: str, debug_events: list):
     if not TOPPILY_API_KEY.strip():
-        err = {"success": False, "message": "TOPPILY_API_KEY is not set.", "http_status": 500}
-        print("[TOPPILY:CONFIG ERROR]", err)
+        err = {"success": False, "message": "API key not set", "http_status": 500}
+        jlog("toppily_config_error", order_id=order_id, trx_ref=trx_ref)
         return False, err
 
-    body = {
-        "recipient_msisdn": phone,
-        "package_id": int(package_id),
-        "trx_ref": trx_ref,
-    }
+    body = {"recipient_msisdn": phone, "package_id": int(package_id), "trx_ref": trx_ref}
 
-    # Try with SSL verification first
+    # 1) Primary: verified TLS (with our CA bundle)
     try:
-        verify_val = (certifi.where() if TOPPILY_VERIFY_SSL else False)
-        ok, payload = _post_toppily(body, verify_val)
-        print(f"[TOPPILY][verify={TOPPILY_VERIFY_SSL}] -> {payload}")
-        return ok, payload
+        verify_val = (_CA_BUNDLE if PRIMARY_VERIFY_SSL else False)
+        ok, data, resp, text = _post_requests(body, verify_val)
+        dbg = _resp_debug(resp, text)
+        blocked = _is_cloudflare_block(text, resp.headers, resp.status_code)
+        payload = {**data, "http_status": resp.status_code}
+        if blocked:
+            payload.setdefault("error", "Cloudflare challenge blocked the request")
+            payload["blocked_by_cloudflare"] = True
+        jlog("toppily_call", order_id=order_id, trx_ref=trx_ref, verify=bool(verify_val), ok=ok,
+             status=resp.status_code, blocked_by_cloudflare=blocked, debug=dbg)
+        debug_events.append({"when": datetime.utcnow(), "stage": "primary", "verify": bool(verify_val),
+                             "ok": ok, "blocked_by_cloudflare": blocked, "debug": dbg})
+        if blocked and USE_CLOUDSCRAPER_FALLBACK:
+            # 2) CF fallback (temporary): try cloudscraper once
+            ok2, data2, resp2, text2 = _post_cloudscraper(body)
+            if resp2 is not None:
+                dbg2 = _resp_debug(resp2, text2)
+                blocked2 = _is_cloudflare_block(text2, resp2.headers, resp2.status_code)
+                payload2 = {**data2, "http_status": resp2.status_code, "note": "cloudscraper fallback used"}
+                if blocked2:
+                    payload2.setdefault("error", "Cloudflare challenge blocked the request (cloudscraper)")
+                    payload2["blocked_by_cloudflare"] = True
+                jlog("toppily_cloudscraper", order_id=order_id, trx_ref=trx_ref, ok=ok2,
+                     status=resp2.status_code, blocked_by_cloudflare=blocked2, debug=dbg2)
+                debug_events.append({"when": datetime.utcnow(), "stage": "cloudscraper", "verify": None,
+                                     "ok": ok2, "blocked_by_cloudflare": blocked2, "debug": dbg2})
+                return (ok2 and not blocked2), payload2
+        return (ok and not blocked), payload
 
     except requests.exceptions.SSLError as e:
-        err_text = f"SSL error: {e}"
-        print("[TOPPILY:SSL ERROR primary]", err_text)
-
-        # Optional insecure fallback (one retry) — use only to unblock while provider fixes TLS
-        if ALLOW_INSECURE_TLS_FALLBACK:
-            try:
-                ok, payload = _post_toppily(body, False)  # verify=False
-                payload.setdefault("note", "Insecure TLS fallback used (verify=False).")
-                print("[TOPPILY:FALLBACK verify=False] ->", payload)
-                return ok, payload
-            except requests.RequestException as e2:
-                err = {"success": False, "error": f"{err_text} / fallback failed: {e2}", "http_status": 597}
-                return False, err
-        else:
-            err = {
-                "success": False,
-                "error": err_text,
-                "hint": "TLS chain verification failed. Enable ALLOW_INSECURE_TLS_FALLBACK=True to retry with verify=False.",
-                "http_status": 597,
-            }
-            return False, err
+        jlog("toppily_ssl_error", order_id=order_id, trx_ref=trx_ref, error=str(e))
+        # If TLS fails even with our bundle, you can temporarily drop to verify=False to inspect origin.
+        try:
+            ok, data, resp, text = _post_requests(body, False)
+            dbg = _resp_debug(resp, text)
+            blocked = _is_cloudflare_block(text, resp.headers, resp.status_code)
+            payload = {**data, "http_status": resp.status_code, "note": "insecure verify=False (diagnostic)"}
+            if blocked:
+                payload.setdefault("error", "Cloudflare challenge blocked the request")
+                payload["blocked_by_cloudflare"] = True
+            jlog("toppily_insecure_diag", order_id=order_id, trx_ref=trx_ref, ok=ok,
+                 status=resp.status_code, blocked_by_cloudflare=blocked, debug=dbg)
+            debug_events.append({"when": datetime.utcnow(), "stage": "insecure-diagnostic", "verify": False,
+                                 "ok": ok, "blocked_by_cloudflare": blocked, "debug": dbg})
+            if blocked and USE_CLOUDSCRAPER_FALLBACK:
+                ok2, data2, resp2, text2 = _post_cloudscraper(body)
+                if resp2 is not None:
+                    dbg2 = _resp_debug(resp2, text2)
+                    blocked2 = _is_cloudflare_block(text2, resp2.headers, resp2.status_code)
+                    payload2 = {**data2, "http_status": resp2.status_code, "note": "cloudscraper fallback used"}
+                    if blocked2:
+                        payload2.setdefault("error", "Cloudflare challenge blocked the request (cloudscraper)")
+                        payload2["blocked_by_cloudflare"] = True
+                    jlog("toppily_cloudscraper", order_id=order_id, trx_ref=trx_ref, ok=ok2,
+                         status=resp2.status_code, blocked_by_cloudflare=blocked2, debug=dbg2)
+                    debug_events.append({"when": datetime.utcnow(), "stage": "cloudscraper", "verify": None,
+                                         "ok": ok2, "blocked_by_cloudflare": blocked2, "debug": dbg2})
+                    return (ok2 and not blocked2), payload2
+            return (ok and not blocked), payload
+        except requests.RequestException as e2:
+            return False, {"success": False, "error": f"SSL + insecure diag failed: {e2}", "http_status": 597}
 
     except requests.RequestException as e:
-        print("[TOPPILY:EXCEPTION]", e)
+        jlog("toppily_network_error", order_id=order_id, trx_ref=trx_ref, error=str(e))
         return False, {"success": False, "error": str(e), "http_status": 599}
 
+# ===========================
+# Route
+# ===========================
 @checkout_bp.route("/checkout", methods=["POST"])
 def process_checkout():
     try:
         # 🔐 Auth
         if "user_id" not in session or session.get("role") != "customer":
-            print("[CHECKOUT] Auth failed. Session keys:", list(session.keys()))
+            jlog("checkout_auth_fail", session_keys=list(session.keys()))
             return jsonify({"success": False, "message": "Not authorized"}), 401
 
         # Validate session user id
@@ -127,7 +236,7 @@ def process_checkout():
         data = request.get_json(silent=True) or {}
         cart = data.get("cart", [])
         method = data.get("method", "wallet")
-        print("[CHECKOUT] Incoming payload:", data)
+        jlog("checkout_incoming", payload=data)
 
         # 🛒 Validate cart
         if not cart or not isinstance(cart, list):
@@ -144,13 +253,13 @@ def process_checkout():
         # 🏦 Balance check
         bal_doc = balances_col.find_one({"user_id": user_id}) or {}
         current_balance = _money(bal_doc.get("amount", 0))
-        print(f"[CHECKOUT] Balance={current_balance} TotalRequested={total_requested}")
+        jlog("checkout_balance", order_id=order_id, balance=current_balance, total=total_requested)
 
         if current_balance < total_requested:
             return jsonify({"success": False, "message": "❌ Insufficient wallet balance"}), 400
 
         # 🚀 Call provider item-by-item
-        results, total_success_amount = [], 0.0
+        results, total_success_amount, debug_events = [], 0.0, []
 
         for idx, item in enumerate(cart, start=1):
             phone = (item.get("phone") or "").strip()
@@ -176,8 +285,7 @@ def process_checkout():
                 continue
 
             trx_ref = f"{order_id}_{idx}_{uuid.uuid4().hex[:6]}"
-            ok, payload = _send_toppily_by_package(phone, pkg_id, trx_ref)
-            print(f"[CHECKOUT] Item {idx}: ok={ok} pkg_id={pkg_id} phone={phone} payload={payload}")
+            ok, payload = _send_toppily_by_package(phone, pkg_id, trx_ref, order_id, debug_events)
 
             results.append({
                 "phone": phone, "amount": amt, "value": item.get("value"),
@@ -188,6 +296,10 @@ def process_checkout():
             if ok:
                 total_success_amount += amt
 
+        # Trim stored debug
+        if len(debug_events) > 10:
+            debug_events = debug_events[-10:]
+
         # 🧮 Nothing succeeded → no charge
         if total_success_amount <= 0:
             orders_col.insert_one({
@@ -195,11 +307,14 @@ def process_checkout():
                 "total_amount": total_requested, "charged_amount": 0.0,
                 "status": "failed", "paid_from": method,
                 "created_at": datetime.utcnow(), "updated_at": datetime.utcnow(),
+                "debug": {"events": debug_events}
             })
+            blocked_any = any(x.get("api_response", {}).get("blocked_by_cloudflare") for x in results)
             return jsonify({
                 "success": False,
                 "message": "No items were processed successfully. You were not charged.",
                 "order_id": order_id,
+                "blocked_by_cloudflare": bool(blocked_any),
                 "details": results
             }), 502
 
@@ -217,6 +332,7 @@ def process_checkout():
             "total_amount": total_requested, "charged_amount": total_success_amount,
             "status": status, "paid_from": method,
             "created_at": datetime.utcnow(), "updated_at": datetime.utcnow(),
+            "debug": {"events": debug_events}
         })
 
         # 🧾 Transaction record
@@ -237,6 +353,5 @@ def process_checkout():
         }), 200
 
     except Exception:
-        print("[CHECKOUT] Uncaught error:\n", traceback.format_exc())
+        jlog("checkout_uncaught", error=traceback.format_exc())
         return jsonify({"success": False, "message": "Server error"}), 500
-
