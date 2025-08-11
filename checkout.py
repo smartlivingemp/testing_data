@@ -2,7 +2,10 @@
 from flask import Blueprint, request, jsonify, session
 from bson import ObjectId
 from datetime import datetime
-import os, uuid, random, requests, certifi, traceback, json, hashlib, pathlib, shutil
+import os, uuid, random, requests, certifi, traceback, json, hashlib
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from db import db
 
@@ -14,16 +17,12 @@ orders_col = db["orders"]
 transactions_col = db["transactions"]
 services_col = db["services"]
 
-# ===== Toppily config (HARD-CODED) =====
+# ===== Toppily config =====
 TOPPILY_URL = "https://toppily.com/api/v1/buy-other-package"
-TOPPILY_API_KEY = "0e7434520859996d4b758c7c77e22013690fc9ae"  # keep secret
+TOPPILY_API_KEY = os.getenv("TOPPILY_API_KEY", "").strip()  # <- set this in your env
 
-# TLS + CF toggles
-USE_CUSTOM_CA_BUNDLE = True
+# CF fallback (temporary). Prefer OFF once provider gives an API host/whitelist.
 USE_CLOUDSCRAPER_FALLBACK = True
-PRIMARY_VERIFY_SSL = True
-
-TOPPILY_INTERMEDIATE_PEM = r""  # optional PEM if provider’s chain is incomplete
 
 # Fallback map (used only if DB lookup fails)
 NETWORK_ID_FALLBACK = {
@@ -32,30 +31,26 @@ NETWORK_ID_FALLBACK = {
     "AIRTELTIGO": 1,
 }
 
-# ===== Startup: custom CA bundle =====
-def _setup_custom_ca_bundle():
-    if not USE_CUSTOM_CA_BUNDLE:
-        return certifi.where()
-    try:
-        ca_dir = pathlib.Path(os.getcwd()) / "vendor_certs"
-        ca_dir.mkdir(parents=True, exist_ok=True)
-        base_ca = certifi.where()
-        custom_ca = ca_dir / "custom_ca_bundle.pem"
-        with open(custom_ca, "wb") as out:
-            with open(base_ca, "rb") as base:
-                shutil.copyfileobj(base, out)
-            pem = TOPPILY_INTERMEDIATE_PEM.strip().encode("utf-8")
-            if pem:
-                out.write(b"\n"); out.write(pem)
-        os.environ["SSL_CERT_FILE"] = str(custom_ca)
-        os.environ["REQUESTS_CA_BUNDLE"] = str(custom_ca)
-        print("[SSL] Using custom CA bundle:", custom_ca)
-        return str(custom_ca)
-    except Exception as e:
-        print("[SSL] Failed to build custom CA bundle:", e)
-        return certifi.where()
+# ===== HTTP session (certifi CA, retries, UA) =====
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.verify = certifi.where()  # trust store from certifi
+    s.headers.update({
+        "User-Agent": "NanDataApp/1.0 (+server)",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    })
+    retries = Retry(
+        total=3,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods={"GET", "POST"},
+        raise_on_status=False,
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    return s
 
-_CA_BUNDLE = _setup_custom_ca_bundle()
+_http = _make_session()
 
 # ===== Tiny JSON logger =====
 def jlog(event: str, **kv):
@@ -70,39 +65,51 @@ def generate_order_id():
     return f"NAN{random.randint(10000, 99999)}"
 
 def _money(v):
-    try: return float(v)
-    except Exception: return 0.0
+    try:
+        return float(v)
+    except Exception:
+        return 0.0
 
 def _is_cloudflare_block(text: str, headers: dict, status: int) -> bool:
-    return (status in (403, 503)) and (
-        "Just a moment..." in text or "__cf_chl_" in text or "challenge-platform" in text
-    )
+    if status not in (403, 503):
+        return False
+    # quick fingerprints
+    snippet = (text or "")[:600]
+    if ("Just a moment" in snippet) or ("challenge-platform" in snippet) or ("__cf_chl_" in snippet):
+        return True
+    try:
+        # header check (case-insensitive)
+        h = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+        if "cf-mitigated" in h or "server" in h and "cloudflare" in h["server"].lower():
+            return True
+    except Exception:
+        pass
+    return False
 
 def _resp_debug(resp: requests.Response, body_text: str):
     redacted_headers = {}
     for k, v in resp.headers.items():
         lk = k.lower()
-        redacted_headers[k] = "***" if lk in ("authorization","cookie","set-cookie","x-api-key") else v
+        redacted_headers[k] = "***" if lk in ("authorization", "cookie", "set-cookie", "x-api-key") else v
     return {
         "status": resp.status_code,
         "headers": redacted_headers,
         "body_len": len(body_text or ""),
-        "body_sha256_16": hashlib.sha256((body_text or "").encode("utf-8","ignore")).hexdigest()[:16],
-        "body_snippet": (body_text or "")[:140].replace("\n"," "),
+        "body_sha256_16": hashlib.sha256((body_text or "").encode("utf-8", "ignore")).hexdigest()[:16],
+        "body_snippet": (body_text or "")[:140].replace("\n", " "),
     }
 
-def _post_requests(body, verify):
-    headers = {
-        "x-api-key": TOPPILY_API_KEY,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "NanDataApp/1.0 (+server)",
-    }
-    resp = requests.post(TOPPILY_URL, headers=headers, json=body, timeout=45, verify=verify)
+def _post_requests(body):
+    if not TOPPILY_API_KEY:
+        raise RuntimeError("TOPPILY_API_KEY not set")
+    headers = {"x-api-key": TOPPILY_API_KEY}
+    resp = _http.post(TOPPILY_URL, headers=headers, json=body, timeout=30)
     text = resp.text or ""
-    try: data = resp.json()
-    except Exception: data = {"raw": text}
-    ok = resp.ok and bool(data.get("success", False))
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw": text}
+    ok = resp.ok and bool(data.get("success"))
     return ok, data, resp, text
 
 def _post_cloudscraper(body):
@@ -110,13 +117,15 @@ def _post_cloudscraper(body):
         import cloudscraper
     except Exception as e:
         return False, {"success": False, "error": f"cloudscraper not installed: {e}"}, None, ""
-    scraper = cloudscraper.create_scraper(browser={"browser":"chrome","platform":"windows","mobile":False})
-    headers = {"x-api-key": TOPPILY_API_KEY, "Accept":"application/json","Content-Type":"application/json"}
+    headers = {"x-api-key": TOPPILY_API_KEY, "Accept": "application/json", "Content-Type": "application/json"}
+    scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
     resp = scraper.post(TOPPILY_URL, headers=headers, json=body, timeout=60)
     text = resp.text or ""
-    try: data = resp.json()
-    except Exception: data = {"raw": text}
-    ok = resp.ok and bool(data.get("success", False))
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw": text}
+    ok = resp.ok and bool(data.get("success"))
     return ok, data, resp, text
 
 # ===== Resolve fields for shared-bundle =====
@@ -124,14 +133,16 @@ def _resolve_network_id(item: dict, value_obj: dict):
     # 1) from payload
     nid = (item or {}).get("network_id") or (value_obj or {}).get("network_id")
     if nid not in (None, "", []):
-        try: return int(nid)
-        except Exception: pass
+        try:
+            return int(nid)
+        except Exception:
+            pass
 
     # 2) from services collection via serviceId
     svc_id = (item or {}).get("serviceId")
     if svc_id:
         try:
-            svc_doc = services_col.find_one({"_id": ObjectId(svc_id)}, {"network_id":1,"name":1,"network":1})
+            svc_doc = services_col.find_one({"_id": ObjectId(svc_id)}, {"network_id": 1, "name": 1, "network": 1})
             if svc_doc and "network_id" in svc_doc and svc_doc["network_id"] not in (None, ""):
                 return int(svc_doc["network_id"])
             guess = (svc_doc.get("name") or svc_doc.get("network") or "").strip().upper() if svc_doc else ""
@@ -150,18 +161,22 @@ def _resolve_network_id(item: dict, value_obj: dict):
 def _resolve_shared_bundle(item: dict, value_obj: dict):
     vol = (value_obj or {}).get("volume")
     if vol not in (None, "", []):
-        try: return int(vol)
-        except Exception: pass
+        try:
+            return int(vol)
+        except Exception:
+            pass
     sb = (item or {}).get("shared_bundle")
     if sb not in (None, "", []):
-        try: return int(sb)
-        except Exception: pass
+        try:
+            return int(sb)
+        except Exception:
+            pass
     return None
 
 # ===== Call Toppily with shared-bundle body =====
 def _send_toppily_shared_bundle(phone: str, network_id: int, shared_bundle: int, trx_ref: str,
                                 order_id: str, debug_events: list):
-    if not TOPPILY_API_KEY.strip():
+    if not TOPPILY_API_KEY:
         err = {"success": False, "message": "API key not set", "http_status": 500}
         jlog("toppily_config_error", order_id=order_id, trx_ref=trx_ref)
         return False, err
@@ -173,18 +188,17 @@ def _send_toppily_shared_bundle(phone: str, network_id: int, shared_bundle: int,
          body={"recipient_msisdn": masked, "network_id": body["network_id"], "shared_bundle": body["shared_bundle"], "trx_ref": trx_ref})
 
     try:
-        verify_val = (_CA_BUNDLE if PRIMARY_VERIFY_SSL else False)
-        ok, data, resp, text = _post_requests(body, verify_val)
+        ok, data, resp, text = _post_requests(body)
         dbg = _resp_debug(resp, text)
         blocked = _is_cloudflare_block(text, resp.headers, resp.status_code)
         payload = {**data, "http_status": resp.status_code}
         if blocked:
             payload.setdefault("error", "Cloudflare challenge blocked the request")
             payload["blocked_by_cloudflare"] = True
-        jlog("toppily_call", order_id=order_id, trx_ref=trx_ref, verify=bool(verify_val), ok=ok,
+        jlog("toppily_call", order_id=order_id, trx_ref=trx_ref, ok=ok,
              status=resp.status_code, blocked_by_cloudflare=blocked, debug=dbg)
-        debug_events.append({"when": datetime.utcnow(), "stage":"primary","verify":bool(verify_val),
-                             "ok":ok,"blocked_by_cloudflare":blocked,"debug":dbg})
+        debug_events.append({"when": datetime.utcnow(), "stage": "primary",
+                             "ok": ok, "blocked_by_cloudflare": blocked, "debug": dbg})
 
         if blocked and USE_CLOUDSCRAPER_FALLBACK:
             ok2, data2, resp2, text2 = _post_cloudscraper(body)
@@ -193,49 +207,15 @@ def _send_toppily_shared_bundle(phone: str, network_id: int, shared_bundle: int,
                 blocked2 = _is_cloudflare_block(text2, resp2.headers, resp2.status_code)
                 payload2 = {**data2, "http_status": resp2.status_code, "note": "cloudscraper fallback used"}
                 if blocked2:
-                    payload2.setdefault("error","Cloudflare challenge blocked the request (cloudscraper)")
+                    payload2.setdefault("error", "Cloudflare challenge blocked the request (cloudscraper)")
                     payload2["blocked_by_cloudflare"] = True
                 jlog("toppily_cloudscraper", order_id=order_id, trx_ref=trx_ref, ok=ok2,
                      status=resp2.status_code, blocked_by_cloudflare=blocked2, debug=dbg2)
-                debug_events.append({"when": datetime.utcnow(), "stage":"cloudscraper","verify":None,
-                                     "ok":ok2,"blocked_by_cloudflare":blocked2,"debug":dbg2})
+                debug_events.append({"when": datetime.utcnow(), "stage": "cloudscraper",
+                                     "ok": ok2, "blocked_by_cloudflare": blocked2, "debug": dbg2})
                 return (ok2 and not blocked2), payload2
 
         return (ok and not blocked), payload
-
-    except requests.exceptions.SSLError as e:
-        jlog("toppily_ssl_error", order_id=order_id, trx_ref=trx_ref, error=str(e))
-        try:
-            ok, data, resp, text = _post_requests(body, False)
-            dbg = _resp_debug(resp, text)
-            blocked = _is_cloudflare_block(text, resp.headers, resp.status_code)
-            payload = {**data, "http_status": resp.status_code, "note":"insecure verify=False (diagnostic)"}
-            if blocked:
-                payload.setdefault("error","Cloudflare challenge blocked the request")
-                payload["blocked_by_cloudflare"] = True
-            jlog("toppily_insecure_diag", order_id=order_id, trx_ref=trx_ref, ok=ok,
-                 status=resp.status_code, blocked_by_cloudflare=blocked, debug=dbg)
-            debug_events.append({"when": datetime.utcnow(), "stage":"insecure-diagnostic","verify":False,
-                                 "ok":ok,"blocked_by_cloudflare":blocked,"debug":dbg})
-
-            if blocked and USE_CLOUDSCRAPER_FALLBACK:
-                ok2, data2, resp2, text2 = _post_cloudscraper(body)
-                if resp2 is not None:
-                    dbg2 = _resp_debug(resp2, text2)
-                    blocked2 = _is_cloudflare_block(text2, resp2.headers, resp2.status_code)
-                    payload2 = {**data2, "http_status": resp2.status_code, "note":"cloudscraper fallback used"}
-                    if blocked2:
-                        payload2.setdefault("error","Cloudflare challenge blocked the request (cloudscraper)")
-                        payload2["blocked_by_cloudflare"] = True
-                    jlog("toppily_cloudscraper", order_id=order_id, trx_ref=trx_ref, ok=ok2,
-                         status=resp2.status_code, blocked_by_cloudflare=blocked2, debug=dbg2)
-                    debug_events.append({"when": datetime.utcnow(), "stage":"cloudscraper","verify":None,
-                                         "ok":ok2,"blocked_by_cloudflare":blocked2,"debug":dbg2})
-                    return (ok2 and not blocked2), payload2
-
-            return (ok and not blocked), payload
-        except requests.RequestException as e2:
-            return False, {"success": False, "error": f"SSL + insecure diag failed: {e2}", "http_status": 597}
 
     except requests.RequestException as e:
         jlog("toppily_network_error", order_id=order_id, trx_ref=trx_ref, error=str(e))
