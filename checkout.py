@@ -2,7 +2,7 @@
 from flask import Blueprint, request, jsonify, session
 from bson import ObjectId
 from datetime import datetime
-import os, uuid, random, requests, certifi, traceback, json, hashlib
+import os, uuid, random, requests, certifi, traceback, json, hashlib, ssl
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -30,6 +30,38 @@ NETWORK_ID_FALLBACK = {
     "VODAFONE": 2,
     "AIRTELTIGO": 1,
 }
+
+# ===== Purge any bad CA env overrides & log TLS boot info =====
+def _purge_ca_env_overrides():
+    removed = {}
+    for k in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        if os.environ.get(k):
+            removed[k] = os.environ.pop(k, None)
+    return removed
+
+_removed_ca_env = _purge_ca_env_overrides()
+
+try:
+    vpaths = None
+    if hasattr(ssl, "get_default_verify_paths"):
+        p = ssl.get_default_verify_paths()
+        vpaths = {
+            "cafile": p.cafile,
+            "capath": p.capath,
+            "openssl_cafile_env": p.openssl_cafile_env,
+            "openssl_cafile": p.openssl_cafile,
+            "openssl_capath_env": p.openssl_capath_env,
+            "openssl_capath": p.openssl_capath,
+        }
+    print(json.dumps({
+        "evt": "tls_boot_info",
+        "openssl_version": ssl.OPENSSL_VERSION,
+        "verify_default_paths": vpaths,
+        "certifi_where": certifi.where(),
+        "removed_ca_env": list(_removed_ca_env.keys())
+    }))
+except Exception as _e:
+    print(json.dumps({"evt":"tls_boot_info_error","error":str(_e)}))
 
 # ===== HTTP session (certifi CA, retries, UA) =====
 def _make_session() -> requests.Session:
@@ -80,7 +112,9 @@ def _is_cloudflare_block(text: str, headers: dict, status: int) -> bool:
     try:
         # header check (case-insensitive)
         h = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
-        if "cf-mitigated" in h or "server" in h and "cloudflare" in h["server"].lower():
+        if "cf-mitigated" in h:
+            return True
+        if "server" in h and "cloudflare" in h["server"].lower():
             return True
     except Exception:
         pass
@@ -342,3 +376,20 @@ def process_checkout():
     except Exception:
         jlog("checkout_uncaught", error=traceback.format_exc())
         return jsonify({"success": False, "message": "Server error"}), 500
+
+# ===== Optional: TLS diagnostic endpoint =====
+@checkout_bp.route("/diag/tls", methods=["GET"])
+def diag_tls():
+    try:
+        r = _http.get("https://toppily.com", timeout=15)
+        return jsonify({
+            "ok": True,
+            "status": r.status_code,
+            "server": r.headers.get("Server"),
+            "cf": "cloudflare" in (r.headers.get("Server","").lower()),
+            "used_ca": certifi.where()
+        }), 200
+    except requests.exceptions.SSLError as e:
+        return jsonify({"ok": False, "type": "ssl", "error": str(e), "used_ca": certifi.where()}), 500
+    except Exception as e:
+        return jsonify({"ok": False, "type": "other", "error": str(e)}), 500
